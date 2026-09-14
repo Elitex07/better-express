@@ -13,12 +13,18 @@ export class TrieNode {
     this.handlers = null;            // Array of handler functions
     this.paramKeys = null;           // Array of { index: number, name: string }
     this.wildcardIndex = -1;         // Index where wildcard starts
+    this.wildcardName = null;        // Name of wildcard parameter (e.g., '*' or 'filepath')
   }
 }
 
 export class Trie {
-  constructor() {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps before aborting ambiguous branch exploration
+   */
+  constructor(options = {}) {
     this.root = new TrieNode();
+    this.maxBacktracks = options.maxBacktracks ?? 500;
   }
 
   /**
@@ -46,10 +52,15 @@ export class Trie {
    * @param {Function[]} handlers 
    */
   insert(path, handlers) {
+    if (!handlers || !Array.isArray(handlers) || handlers.length === 0) {
+      throw new TypeError(`Route "${path}" requires at least one handler function`);
+    }
+
     const segments = Trie.splitPath(path);
     let current = this.root;
     const paramKeys = [];
     let wildcardIndex = -1;
+    let wildcardName = null;
 
     for (let i = 0; i < segments.length; i++) {
       const segment = segments[i];
@@ -62,8 +73,14 @@ export class Trie {
         current = current.paramChild;
       } else if (segment === '*' || segment.startsWith('*')) {
         wildcardIndex = i;
-        if (!current.wildcardChild) {
+        wildcardName = segment === '*' ? '*' : segment.slice(1);
+        if (current.wildcardChild) {
+          if (current.wildcardChild.wildcardName && current.wildcardChild.wildcardName !== wildcardName) {
+            throw new Error(`Route collision: wildcard "*${wildcardName}" conflicts with existing wildcard "*${current.wildcardChild.wildcardName}" on path "${path}"`);
+          }
+        } else {
           current.wildcardChild = new TrieNode('*');
+          current.wildcardChild.wildcardName = wildcardName;
         }
         current = current.wildcardChild;
         break; // Wildcard consumes everything remaining
@@ -82,6 +99,9 @@ export class Trie {
     }
     current.paramKeys = current.paramKeys || paramKeys;
     current.wildcardIndex = current.wildcardIndex !== -1 ? current.wildcardIndex : wildcardIndex;
+    if (wildcardName) {
+      current.wildcardName = wildcardName;
+    }
   }
 
   /**
@@ -92,9 +112,10 @@ export class Trie {
    */
   search(pathname) {
     const segments = Trie.splitPath(pathname);
-    const match = this._searchNode(this.root, segments, 0);
+    const state = { backtracks: 0 };
+    const match = this._searchNode(this.root, segments, 0, state);
 
-    if (match && match.handlers) {
+    if (match && match.handlers && match.handlers.length > 0) {
       const params = {};
       if (match.paramKeys) {
         for (const { index, name } of match.paramKeys) {
@@ -108,10 +129,15 @@ export class Trie {
       }
       if (match.wildcardIndex !== -1) {
         const rawWildcard = segments.slice(match.wildcardIndex).join('/');
+        let val;
         try {
-          params['*'] = decodeURIComponent(rawWildcard);
+          val = decodeURIComponent(rawWildcard);
         } catch {
-          params['*'] = rawWildcard;
+          val = rawWildcard;
+        }
+        params['*'] = val;
+        if (match.wildcardName && match.wildcardName !== '*') {
+          params[match.wildcardName] = val;
         }
       }
       return { handlers: match.handlers, params };
@@ -120,12 +146,12 @@ export class Trie {
     return null;
   }
 
-  _searchNode(node, segments, index) {
+  _searchNode(node, segments, index, state = { backtracks: 0 }) {
     // Reached the end of segments
     if (index === segments.length) {
-      if (node.handlers) return node;
+      if (node.handlers && node.handlers.length > 0) return node;
       // If no exact match handlers, check if wildcard child matches empty
-      if (node.wildcardChild && node.wildcardChild.handlers) {
+      if (node.wildcardChild && node.wildcardChild.handlers && node.wildcardChild.handlers.length > 0) {
         return node.wildcardChild;
       }
       return null;
@@ -135,18 +161,25 @@ export class Trie {
 
     // 1. Try exact static match first
     if (node.staticChildren.has(segment)) {
-      const match = this._searchNode(node.staticChildren.get(segment), segments, index + 1);
+      const match = this._searchNode(node.staticChildren.get(segment), segments, index + 1, state);
       if (match) return match;
     }
 
     // 2. Try parameterized match (:param)
     if (node.paramChild) {
-      const match = this._searchNode(node.paramChild, segments, index + 1);
+      // If we already attempted staticChildren and it failed, this branch incurs a backtrack
+      if (node.staticChildren.has(segment)) {
+        state.backtracks++;
+        if (state.backtracks > this.maxBacktracks) {
+          return null; // Stop unbounded backtracking
+        }
+      }
+      const match = this._searchNode(node.paramChild, segments, index + 1, state);
       if (match) return match;
     }
 
     // 3. Try wildcard match (*)
-    if (node.wildcardChild && node.wildcardChild.handlers) {
+    if (node.wildcardChild && node.wildcardChild.handlers && node.wildcardChild.handlers.length > 0) {
       return node.wildcardChild;
     }
 

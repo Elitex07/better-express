@@ -53,12 +53,12 @@ export class MiddlewareStack {
     const errorHandlers = [];
 
     for (const entry of this.entries) {
+      const matchesPrefix = entry.prefix === '/' || pathname === entry.prefix || pathname.startsWith(entry.prefix + '/');
+      if (!matchesPrefix) continue;
+
       if (entry.isErrorHandler) {
         errorHandlers.push(entry.handler);
-        continue;
-      }
-
-      if (entry.prefix === '/' || pathname === entry.prefix || pathname.startsWith(entry.prefix + '/')) {
+      } else {
         pipeline.push({ prefix: entry.prefix, handler: entry.handler });
       }
     }

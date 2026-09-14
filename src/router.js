@@ -12,17 +12,30 @@ export function joinPaths(p1 = '', p2 = '') {
 }
 
 export class Router {
-  constructor() {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   */
+  constructor(options = {}) {
+    this.options = options;
+
     /** @type {Map<string, Trie>} */
     this.trees = new Map();
     for (const method of HTTP_METHODS) {
-      this.trees.set(method, new Trie());
+      this.trees.set(method, new Trie(options));
     }
 
     /** @type {Array<{ method: string, path: string, handlers: Function[] }>} */
     this.routes = [];
 
-    /** @type {Array<{ prefix: string, handler: Function, isErrorHandler: boolean }>} */
+    /**
+     * Router-level middlewares.
+     * Used for standalone Router matching via Router.find().
+     * Note: When mounted on BareWeb (app.use(prefix, router)), BareWeb flattens these
+     * into its unified MiddlewareStack so that execution order (including error handlers)
+     * is strictly preserved across global and sub-router boundaries.
+     * @type {Array<{ prefix: string, handler: Function, isErrorHandler: boolean }>}
+     */
     this.middlewares = [];
   }
 
@@ -93,10 +106,14 @@ export class Router {
   add(method, path, ...handlers) {
     const upperMethod = method.toUpperCase();
     if (!this.trees.has(upperMethod)) {
-      this.trees.set(upperMethod, new Trie());
+      this.trees.set(upperMethod, new Trie(this.options));
     }
 
     const flatHandlers = handlers.flat();
+    if (flatHandlers.length === 0) {
+      throw new TypeError(`Route "${upperMethod} ${path}" requires at least one handler function`);
+    }
+
     const trie = this.trees.get(upperMethod);
     trie.insert(path, flatHandlers);
 

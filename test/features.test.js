@@ -82,6 +82,27 @@ describe('BareWeb Advanced Features Integration Tests', () => {
       res.sendFile(fixtureFile);
     });
 
+    // 10. Scoped error handlers & route isolation
+    app.use('/scoped-api', (err, req, res, next) => {
+      res.status(500).json({ scopedToApi: true, msg: err.message });
+    });
+    app.get('/scoped-api/fail', () => {
+      throw new Error('error inside scoped api');
+    });
+    app.get('/admin/fail', () => {
+      throw new Error('error inside admin');
+    });
+
+    // 11. Sub-router with router-scoped error handler
+    const subRouter = new Router();
+    subRouter.get('/trigger-err', () => {
+      throw new Error('sub-router exception');
+    });
+    subRouter.use((err, req, res, next) => {
+      res.status(502).json({ caughtBySubRouter: true, detail: err.message });
+    });
+    app.use('/sub-err', subRouter);
+
     // Start server
     await new Promise((resolve) => {
       server = app.listen(0, '127.0.0.1', () => {
@@ -215,5 +236,32 @@ describe('BareWeb Advanced Features Integration Tests', () => {
     assert.strictEqual(res.headers.get('content-type'), 'text/plain; charset=utf-8');
     const content = await res.text();
     assert.strictEqual(content, 'Hello BareWeb Static Files!');
+  });
+
+  it('should not invoke error-handling middleware scoped to a different prefix', async () => {
+    // GET /admin/fail should not trigger error handler scoped to /scoped-api
+    const res = await fetch(`${baseUrl}/admin/fail`);
+    assert.strictEqual(res.status, 500);
+    const data = await res.json();
+    assert.strictEqual(data.scopedToApi, undefined);
+    assert.strictEqual(data.error.message, 'error inside admin');
+  });
+
+  it('should invoke error-handling middleware when matching its scoped prefix', async () => {
+    // GET /scoped-api/fail should trigger error handler scoped to /scoped-api
+    const res = await fetch(`${baseUrl}/scoped-api/fail`);
+    assert.strictEqual(res.status, 500);
+    const data = await res.json();
+    assert.strictEqual(data.scopedToApi, true);
+    assert.strictEqual(data.msg, 'error inside scoped api');
+  });
+
+  it('should properly invoke error handlers registered on mounted sub-routers', async () => {
+    // GET /sub-err/trigger-err should trigger sub-router's scoped error handler
+    const res = await fetch(`${baseUrl}/sub-err/trigger-err`);
+    assert.strictEqual(res.status, 502);
+    const data = await res.json();
+    assert.strictEqual(data.caughtBySubRouter, true);
+    assert.strictEqual(data.detail, 'sub-router exception');
   });
 });

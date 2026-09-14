@@ -99,6 +99,64 @@ describe('Trie Route Matching', () => {
     assert.strictEqual(match.handlers[0], h1);
     assert.strictEqual(match.handlers[1], h2);
   });
+
+  it('should support named wildcard parameters and expose both named key and *', () => {
+    const trie = new Trie();
+    const handler = () => 'named-wildcard';
+
+    trie.insert('/files/*filepath', [handler]);
+
+    const match = trie.search('/files/documents/2026/report.pdf');
+    assert.ok(match);
+    assert.strictEqual(match.handlers[0], handler);
+    assert.strictEqual(match.params['*'], 'documents/2026/report.pdf');
+    assert.strictEqual(match.params.filepath, 'documents/2026/report.pdf');
+  });
+
+  it('should reject colliding named wildcards on the same prefix', () => {
+    const trie = new Trie();
+    const h1 = () => 'first';
+    const h2 = () => 'second';
+
+    trie.insert('/files/*foo', [h1]);
+    assert.throws(
+      () => trie.insert('/files/*bar', [h2]),
+      /Route collision: wildcard "\*bar" conflicts with existing wildcard "\*foo"/
+    );
+  });
+
+  it('should throw TypeError when inserting empty handler array', () => {
+    const trie = new Trie();
+    assert.throws(
+      () => trie.insert('/empty', []),
+      /requires at least one handler function/
+    );
+  });
+
+  it('should bound backtracking on adversarial ambiguous route tables without hanging or exploding', () => {
+    const trie = new Trie({ maxBacktracks: 100 });
+    const n = 16;
+
+    // Generate adversarial tree with static and param siblings at every level
+    function insertCombos(prefix, depth) {
+      if (depth === n) {
+        trie.insert(prefix + '/endpoint', [() => 'match']);
+        return;
+      }
+      insertCombos(prefix + '/a', depth + 1);
+      insertCombos(prefix + '/:p' + depth, depth + 1);
+    }
+    insertCombos('', 0);
+
+    // Search an adversarial path that forces backtracking
+    const searchPath = '/' + Array(n).fill('a').join('/') + '/missing';
+    const start = performance.now();
+    const match = trie.search(searchPath);
+    const duration = performance.now() - start;
+
+    assert.strictEqual(match, null);
+    assert.ok(duration < 50, `Expected search under 50ms, took ${duration.toFixed(2)}ms`);
+  });
 });
 
 describe('Router Method Dispatching & Sub-Routers', () => {
@@ -164,5 +222,13 @@ describe('Router Method Dispatching & Sub-Routers', () => {
     assert.strictEqual(joinPaths('/', '/test'), '/test');
     assert.strictEqual(joinPaths('/api', '/'), '/api');
     assert.strictEqual(joinPaths('', '/test'), '/test');
+  });
+
+  it('should throw TypeError when route is added with no handlers', () => {
+    const router = new Router();
+    assert.throws(
+      () => router.get('/foo'),
+      /Route "GET \/foo" requires at least one handler function/
+    );
   });
 });

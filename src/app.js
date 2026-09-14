@@ -5,8 +5,13 @@ import { decorateRequest } from './request.js';
 import { decorateResponse } from './response.js';
 
 export class BareWeb {
-  constructor() {
-    this.router = new Router();
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   */
+  constructor(options = {}) {
+    this.options = options;
+    this.router = new Router(options);
     this.middleware = new MiddlewareStack();
     this.server = null;
 
@@ -142,7 +147,8 @@ export class BareWeb {
 
 /**
  * Factory function to create a new BareWeb application instance.
+ * @param {object} [options]
  */
-export function createApp() {
-  return new BareWeb();
+export function createApp(options) {
+  return new BareWeb(options);
 }

@@ -8,9 +8,9 @@ BareWeb is designed to fulfill the core capabilities of standard web frameworks 
 
 ## ✨ Features
 
-- 🌲 **Radix Tree / Trie Router**: $O(K)$ path matching (where $K$ is path segment depth) avoiding slow linear regex matching.
+- 🌲 **Radix Tree / Trie Router**: $O(K)$ path matching (where $K$ is path segment depth) for unambiguous routes, avoiding slow linear regex evaluation. Backtracking is bounded to protect against CPU exhaustion on ambiguous static/parameter siblings.
 - 🪶 **Zero Runtime Dependencies**: The core server framework runs natively on Node.js standard libraries (`node:http`, `node:fs`, `node:path`).
-- ⚡ **High Throughput & Low Latency**: 25-35%+ higher throughput and lower p99 latency than Express.js.
+- ⚡ **High Throughput & Low Latency**: Consistently higher throughput and lower tail latency than Express.js across typical micro-benchmarks.
 - 🔀 **Sub-Router Support**: Full modular routing with `Router`, sub-router prefix mounting (`app.use('/api', apiRouter)`), and router-scoped middleware.
 - 🔄 **Async Middleware Pipeline**: Modern middleware engine supporting `await next()` and Express-style `(req, res, next)` signatures with `req.baseUrl`.
 - 📦 **Built-in Async Parsers**: Native `await req.json()`, `await req.text()`, and `await req.urlencoded()` streaming parsers with safe HTTP 413 limit enforcement.
@@ -40,6 +40,7 @@ BareWeb /
 │   └── features.test.js  # Integration tests for CORS, static serving, cookies, forms, limits
 ├── benchmarks/
 │   └── compare.js        # Automated benchmark suite vs Express.js
+├── ROADMAP.md            # Strategic architecture roadmap & feature tiers
 └── package.json
 ```
 
@@ -135,8 +136,14 @@ npm test
 
 ## 📊 Benchmarks (BareWeb vs Express.js)
 
-Run the automated benchmark suite comparing BareWeb with Express.js under identical load using `autocannon`:
+Run the automated benchmark suite comparing BareWeb with Express.js under identical load using `autocannon`. The suite runs a warm-up phase for V8 JIT optimization followed by multiple trials to calculate mean throughput, standard deviation, and p99 latency:
 
 ```bash
 npm run benchmark
 ```
+
+---
+
+## 🗺️ Roadmap & Future Architecture
+
+Looking to contribute or explore upcoming features? Check out our [Development Roadmap](file:///c:/Users/prate/Bareweb/BareWeb/ROADMAP.md) detailing TypeScript definitions, native Server-Sent Events (SSE), response compression, and Express middleware interoperability.
