@@ -14,6 +14,7 @@ export class TrieNode {
     this.paramKeys = null;           // Array of { index: number, name: string }
     this.wildcardIndex = -1;         // Index where wildcard starts
     this.wildcardName = null;        // Name of wildcard parameter (e.g., '*' or 'filepath')
+    this.routes = [];                // Route definitions retaining paramKeys & handlers
   }
 }
 
@@ -50,8 +51,9 @@ export class Trie {
    * Insert a route path and its associated handlers into the Trie.
    * @param {string} path 
    * @param {Function[]} handlers 
+   * @param {object} [routeEntry] Optional parent route entry reference
    */
-  insert(path, handlers) {
+  insert(path, handlers, routeEntry = null) {
     if (!handlers || !Array.isArray(handlers) || handlers.length === 0) {
       throw new TypeError(`Route "${path}" requires at least one handler function`);
     }
@@ -92,12 +94,32 @@ export class Trie {
       }
     }
 
+    const routeDef = {
+      handlers,
+      paramKeys,
+      wildcardIndex,
+      wildcardName,
+      routeEntry
+    };
+    if (!current.routes) {
+      current.routes = [];
+    }
+    current.routes.push(routeDef);
+
     if (current.handlers) {
       current.handlers = current.handlers.concat(handlers);
     } else {
       current.handlers = handlers;
     }
-    current.paramKeys = current.paramKeys || paramKeys;
+    if (current.paramKeys) {
+      for (const pk of paramKeys) {
+        if (!current.paramKeys.some(existing => existing.index === pk.index && existing.name === pk.name)) {
+          current.paramKeys.push(pk);
+        }
+      }
+    } else {
+      current.paramKeys = paramKeys.slice();
+    }
     current.wildcardIndex = current.wildcardIndex !== -1 ? current.wildcardIndex : wildcardIndex;
     if (wildcardName) {
       current.wildcardName = wildcardName;
@@ -106,41 +128,98 @@ export class Trie {
 
   /**
    * Search for a route matching the given pathname.
-   * Returns { handlers, params } or null if no route matches.
+   * Returns { handlers, params, handlersWithParams, routeEntries } or null if no route matches.
    * @param {string} pathname 
-   * @returns {{ handlers: Function[], params: Record<string, string> } | null}
+   * @returns {{ handlers: Function[], params: Record<string, string>, handlersWithParams: Array<{ handler: Function, params: Record<string, string> }>, routeEntries: any[] } | null}
    */
   search(pathname) {
     const segments = Trie.splitPath(pathname);
     const state = { backtracks: 0 };
     const match = this._searchNode(this.root, segments, 0, state);
 
-    if (match && match.handlers && match.handlers.length > 0) {
+    if (match && ((match.routes && match.routes.length > 0) || (match.handlers && match.handlers.length > 0))) {
       const params = {};
-      if (match.paramKeys) {
-        for (const { index, name } of match.paramKeys) {
-          const rawVal = segments[index];
-          try {
-            params[name] = decodeURIComponent(rawVal);
-          } catch {
-            params[name] = rawVal;
+      const handlersWithParams = [];
+      const allHandlers = [];
+      const matchedRouteEntries = [];
+
+      if (match.routes && match.routes.length > 0) {
+        for (const route of match.routes) {
+          const routeParams = {};
+          if (route.paramKeys) {
+            for (const { index, name } of route.paramKeys) {
+              const rawVal = segments[index];
+              let val;
+              try {
+                val = decodeURIComponent(rawVal);
+              } catch {
+                val = rawVal;
+              }
+              routeParams[name] = val;
+              params[name] = val;
+            }
+          }
+          if (route.wildcardIndex !== -1) {
+            const rawWildcard = segments.slice(route.wildcardIndex).join('/');
+            let val;
+            try {
+              val = decodeURIComponent(rawWildcard);
+            } catch {
+              val = rawWildcard;
+            }
+            routeParams['*'] = val;
+            params['*'] = val;
+            if (route.wildcardName && route.wildcardName !== '*') {
+              routeParams[route.wildcardName] = val;
+              params[route.wildcardName] = val;
+            }
+          }
+          if (route.routeEntry) {
+            route.routeEntry.params = routeParams;
+            matchedRouteEntries.push(route.routeEntry);
+          }
+          for (const h of route.handlers) {
+            allHandlers.push(h);
+            handlersWithParams.push({ handler: h, params: routeParams, routeEntry: route.routeEntry });
           }
         }
-      }
-      if (match.wildcardIndex !== -1) {
-        const rawWildcard = segments.slice(match.wildcardIndex).join('/');
-        let val;
-        try {
-          val = decodeURIComponent(rawWildcard);
-        } catch {
-          val = rawWildcard;
+      } else {
+        if (match.paramKeys) {
+          for (const { index, name } of match.paramKeys) {
+            const rawVal = segments[index];
+            try {
+              params[name] = decodeURIComponent(rawVal);
+            } catch {
+              params[name] = rawVal;
+            }
+          }
         }
-        params['*'] = val;
-        if (match.wildcardName && match.wildcardName !== '*') {
-          params[match.wildcardName] = val;
+        if (match.wildcardIndex !== -1) {
+          const rawWildcard = segments.slice(match.wildcardIndex).join('/');
+          let val;
+          try {
+            val = decodeURIComponent(rawWildcard);
+          } catch {
+            val = rawWildcard;
+          }
+          params['*'] = val;
+          if (match.wildcardName && match.wildcardName !== '*') {
+            params[match.wildcardName] = val;
+          }
+        }
+        for (const h of match.handlers) {
+          allHandlers.push(h);
+          handlersWithParams.push({ handler: h, params });
         }
       }
-      return { handlers: match.handlers, params };
+
+      return {
+        handlers: allHandlers,
+        handlersWithParams,
+        params,
+        routeEntries: matchedRouteEntries,
+        routes: match.routes
+      };
     }
 
     return null;

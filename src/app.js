@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { Router, HTTP_METHODS, joinPaths } from './router.js';
-import { MiddlewareStack } from './middleware.js';
+import { MiddlewareStack, defaultErrorHandler } from './middleware.js';
 import { decorateRequest } from './request.js';
 import { decorateResponse } from './response.js';
 
@@ -12,8 +12,13 @@ export class BareWeb {
   constructor(options = {}) {
     this.options = options;
     this.router = new Router(options);
-    this.middleware = new MiddlewareStack();
     this.server = null;
+    this.middleware = {
+      use: (...args) => this.use(...args),
+      get entries() {
+        return this.router ? this.router.middlewares : [];
+      }
+    };
 
     // Bind handler so it can be passed directly as a callback
     this.handle = this.handle.bind(this);
@@ -21,6 +26,7 @@ export class BareWeb {
 
   /**
    * Register middleware with an optional path prefix, or mount a sub-router/sub-app.
+   * Preserves exact registration sequence between middlewares and route handlers.
    * @param {string|Function|Router|BareWeb} prefixOrFn 
    * @param  {...Function|Router|BareWeb} fns 
    */
@@ -41,25 +47,11 @@ export class BareWeb {
       if (!item) continue;
 
       if (item instanceof Router) {
-        for (const mw of item.middlewares) {
-          const fullPrefix = joinPaths(prefix, mw.prefix);
-          this.middleware.use(fullPrefix, mw.handler);
-        }
-        for (const route of item.routes) {
-          const fullPath = joinPaths(prefix, route.path);
-          this.router.add(route.method, fullPath, ...route.handlers);
-        }
+        this.router.mount(prefix, item);
       } else if (item instanceof BareWeb) {
-        for (const mw of item.middleware.entries) {
-          const fullPrefix = joinPaths(prefix, mw.prefix);
-          this.middleware.use(fullPrefix, mw.handler);
-        }
-        for (const route of item.router.routes) {
-          const fullPath = joinPaths(prefix, route.path);
-          this.router.add(route.method, fullPath, ...route.handlers);
-        }
+        this.router.mount(prefix, item.router);
       } else if (typeof item === 'function') {
-        this.middleware.use(prefix, item);
+        this.router.use(prefix, item);
       }
     }
 
@@ -78,35 +70,99 @@ export class BareWeb {
 
   /**
    * Master request handler that processes incoming HTTP requests.
+   * Safely parses URLs, handles malformed hosts, and dispatches in registration order.
    * @param {http.IncomingMessage} req 
    * @param {http.ServerResponse} res 
    */
   async handle(req, res) {
-    const host = req.headers.host || 'localhost';
-    const parsedUrl = new URL(req.url, `http://${host}`);
-    const pathname = parsedUrl.pathname;
-
-    // Find route in Radix Tree
-    const match = this.router.find(req.method, pathname);
-    const params = match ? match.params : {};
-    const routeHandlers = match ? match.handlers : [];
-
-    // Decorate request and response objects
-    decorateRequest(req, params, parsedUrl);
     decorateResponse(res);
 
+    let parsedUrl;
     try {
-      // Execute middleware and matched route handlers
-      await this.middleware.run(req, res, routeHandlers, Boolean(match));
-    } catch (err) {
+      const host = req.headers.host || 'localhost';
+      parsedUrl = new URL(req.url, `http://${host}`);
+    } catch {
       if (!res.writableEnded) {
-        const statusCode = err.statusCode || err.status || 500;
-        res.status(statusCode).json({
+        res.status(400).json({
           error: {
-            message: err.message || 'Internal Server Error',
-            statusCode
+            message: 'Bad Request: Malformed Host or URL',
+            statusCode: 400
           }
         });
+      }
+      return;
+    }
+
+    const pathname = parsedUrl.pathname;
+    const { isRouteMatched, params, pipeline, errorHandlers } = this.router.resolve(req.method, pathname);
+
+    // Decorate request object
+    decorateRequest(req, params, parsedUrl);
+
+    let index = 0;
+
+    const next = async (err) => {
+      if (err) {
+        return handleErrors(err);
+      }
+
+      if (index >= pipeline.length) {
+        // Reached end of pipeline
+        if (!isRouteMatched && !res.writableEnded) {
+          res.status(404).json({
+            error: {
+              message: `Cannot ${req.method} ${pathname}`,
+              statusCode: 404
+            }
+          });
+        }
+        return;
+      }
+
+      const item = pipeline[index++];
+      req.baseUrl = item.prefix === '/' ? '' : item.prefix;
+      const fn = item.handler;
+
+      try {
+        const result = fn(req, res, next);
+        if (result && typeof result.then === 'function') {
+          await result;
+        }
+      } catch (catchedErr) {
+        await handleErrors(catchedErr);
+      }
+    };
+
+    const handleErrors = async (err) => {
+      if (errorHandlers.length > 0) {
+        let errIdx = 0;
+        const nextErr = async (e) => {
+          if (errIdx >= errorHandlers.length) {
+            defaultErrorHandler(e || err, req, res);
+            return;
+          }
+          const item = errorHandlers[errIdx++];
+          req.baseUrl = item.prefix === '/' ? '' : item.prefix;
+          try {
+            const resVal = item.handler(e || err, req, res, nextErr);
+            if (resVal && typeof resVal.then === 'function') {
+              await resVal;
+            }
+          } catch (unexpected) {
+            defaultErrorHandler(unexpected, req, res);
+          }
+        };
+        await nextErr(err);
+      } else {
+        defaultErrorHandler(err, req, res);
+      }
+    };
+
+    try {
+      await next();
+    } catch (err) {
+      if (!res.writableEnded) {
+        defaultErrorHandler(err, req, res);
       }
     }
   }

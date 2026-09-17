@@ -198,22 +198,41 @@ export function decorateResponse(res) {
 
   /**
    * Stream a file to the response with proper Content-Type.
+   * Resolves cleanly after handling 404/500 responses, or invokes provided callback / onError.
    * @param {string} filePath 
-   * @param {object} [options] 
+   * @param {object|Function} [optionsOrCallback] 
+   * @param {Function} [maybeCallback]
    * @returns {Promise<void>}
    */
-  res.sendFile = function(filePath, options = {}) {
-    return new Promise((resolve, reject) => {
+  res.sendFile = function(filePath, optionsOrCallback = {}, maybeCallback) {
+    let options = optionsOrCallback;
+    let callback = maybeCallback;
+
+    if (typeof optionsOrCallback === 'function') {
+      callback = optionsOrCallback;
+      options = {};
+    }
+
+    return new Promise((resolve) => {
       fs.stat(filePath, (err, stats) => {
         if (err || !stats.isFile()) {
           const error = new Error(`File not found: ${filePath}`);
           error.statusCode = 404;
-          if (options.onError) {
+
+          if (callback) {
+            callback(error);
+            return resolve();
+          }
+
+          if (options && options.onError) {
             options.onError(error);
-          } else if (!res.writableEnded) {
+            return resolve();
+          }
+
+          if (!res.writableEnded) {
             res.status(404).json({ error: { message: error.message, statusCode: 404 } });
           }
-          return reject(error);
+          return resolve();
         }
 
         const ext = path.extname(filePath).toLowerCase();
@@ -221,18 +240,31 @@ export function decorateResponse(res) {
 
         res.setHeader('Content-Type', contentType);
         res.setHeader('Content-Length', stats.size);
-        if (options.cacheControl) {
+        if (options && options.cacheControl) {
           res.setHeader('Cache-Control', options.cacheControl);
         }
 
         const stream = fs.createReadStream(filePath);
         stream.pipe(res);
-        stream.on('end', () => resolve());
+
+        stream.on('end', () => {
+          if (callback) callback(null);
+          resolve();
+        });
+
         stream.on('error', (streamErr) => {
+          if (callback) {
+            callback(streamErr);
+            return resolve();
+          }
+          if (options && options.onError) {
+            options.onError(streamErr);
+            return resolve();
+          }
           if (!res.writableEnded) {
             res.status(500).end('File stream error');
           }
-          reject(streamErr);
+          resolve();
         });
       });
     });

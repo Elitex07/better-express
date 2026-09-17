@@ -72,6 +72,19 @@ export class MiddlewareStack {
       }
     }
 
+    await this.runPipeline(req, res, pipeline, errorHandlers, isRouteMatched);
+  }
+
+  /**
+   * Execute a resolved pipeline of middlewares and route handlers in exact registration sequence.
+   * @param {object} req 
+   * @param {object} res 
+   * @param {Array<{ prefix: string, handler: Function, params?: object }>} pipeline 
+   * @param {Array<{ prefix: string, handler: Function, params?: object }>} errorHandlers 
+   * @param {boolean} isRouteMatched 
+   */
+  async runPipeline(req, res, pipeline = [], errorHandlers = [], isRouteMatched = false) {
+    const pathname = req.path;
     let index = 0;
 
     const next = async (err) => {
@@ -94,7 +107,10 @@ export class MiddlewareStack {
 
       const item = pipeline[index++];
       req.baseUrl = item.prefix === '/' ? '' : item.prefix;
-      const fn = item.handler;
+      if (item.params) {
+        req.params = { ...(req.params || {}), ...item.params };
+      }
+      const fn = typeof item === 'function' ? item : item.handler;
 
       try {
         const result = fn(req, res, next);
@@ -114,7 +130,11 @@ export class MiddlewareStack {
             defaultErrorHandler(e || err, req, res);
             return;
           }
-          const errFn = errorHandlers[errIdx++];
+          const errItem = errorHandlers[errIdx++];
+          if (errItem.params) {
+            req.params = { ...(req.params || {}), ...errItem.params };
+          }
+          const errFn = typeof errItem === 'function' ? errItem : errItem.handler;
           try {
             const resVal = errFn(e || err, req, res, nextErr);
             if (resVal && typeof resVal.then === 'function') {
@@ -134,7 +154,7 @@ export class MiddlewareStack {
   }
 }
 
-function defaultErrorHandler(err, req, res) {
+export function defaultErrorHandler(err, req, res) {
   if (res.writableEnded) return;
 
   const statusCode = err.statusCode || err.status || 500;
@@ -190,6 +210,12 @@ export function cors(options = {}) {
  */
 export function serveStatic(rootPath, options = {}) {
   const resolvedRoot = path.resolve(rootPath);
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync(resolvedRoot);
+  } catch {
+    realRoot = resolvedRoot;
+  }
   const indexFile = options.index === false ? null : (options.index || 'index.html');
 
   return async (req, res, next) => {
@@ -222,32 +248,53 @@ export function serveStatic(rootPath, options = {}) {
 
     let filePath = path.resolve(resolvedRoot, '.' + subPath);
 
-    // Prevent directory traversal attacks
-    if (!filePath.startsWith(resolvedRoot)) {
+    // Lexical check
+    if (filePath !== resolvedRoot && !filePath.startsWith(resolvedRoot + path.sep)) {
       return res.status(403).send('Forbidden');
     }
 
-    fs.stat(filePath, async (err, stats) => {
-      if (err) {
+    // Check real path to ensure symlinks inside static root do not escape
+    fs.realpath(filePath, async (realErr, realFilePath) => {
+      if (realErr) {
         return next();
       }
 
-      if (stats.isDirectory()) {
-        if (!indexFile) return next();
-        filePath = path.join(filePath, indexFile);
-        try {
-          const indexStats = await fs.promises.stat(filePath);
-          if (!indexStats.isFile()) return next();
-        } catch {
-          return next();
-        }
+      const rel = path.relative(realRoot, realFilePath);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        return res.status(403).send('Forbidden');
       }
 
-      try {
-        await res.sendFile(filePath, options);
-      } catch {
-        next();
-      }
+      fs.stat(realFilePath, async (err, stats) => {
+        if (err) {
+          return next();
+        }
+
+        let fileToServe = realFilePath;
+        if (stats.isDirectory()) {
+          if (!indexFile) return next();
+          const candidateIndex = path.join(realFilePath, indexFile);
+          try {
+            const realIndex = await fs.promises.realpath(candidateIndex);
+            const relIndex = path.relative(realRoot, realIndex);
+            if (relIndex.startsWith('..') || path.isAbsolute(relIndex)) {
+              return res.status(403).send('Forbidden');
+            }
+            const indexStats = await fs.promises.stat(realIndex);
+            if (!indexStats.isFile()) return next();
+            fileToServe = realIndex;
+          } catch {
+            return next();
+          }
+        } else if (!stats.isFile()) {
+          return next();
+        }
+
+        try {
+          await res.sendFile(fileToServe, options);
+        } catch {
+          next();
+        }
+      });
     });
   };
 }

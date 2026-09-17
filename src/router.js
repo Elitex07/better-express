@@ -29,14 +29,17 @@ export class Router {
     this.routes = [];
 
     /**
-     * Router-level middlewares.
-     * Used for standalone Router matching via Router.find().
-     * Note: When mounted on BareWeb (app.use(prefix, router)), BareWeb flattens these
-     * into its unified MiddlewareStack so that execution order (including error handlers)
-     * is strictly preserved across global and sub-router boundaries.
+     * Router-level middlewares (maintained for backwards compatibility).
      * @type {Array<{ prefix: string, handler: Function, isErrorHandler: boolean }>}
      */
     this.middlewares = [];
+
+    /**
+     * Unified registration sequence of all middlewares and routes.
+     * @type {Array<object>}
+     */
+    this.stack = [];
+    this._seq = 0;
   }
 
   /**
@@ -61,10 +64,21 @@ export class Router {
       if (!item) continue;
 
       if (item instanceof Router) {
-        // Mount sub-router
+        // Mount sub-router preserving its internal registration sequence
         this.mount(prefix, item);
+      } else if (item && item.router instanceof Router) {
+        // Mount BareWeb sub-application preserving its internal registration sequence
+        this.mount(prefix, item.router);
       } else if (typeof item === 'function') {
         const isErrorHandler = item.length === 4;
+        const entry = {
+          type: 'middleware',
+          id: ++this._seq,
+          prefix,
+          handler: item,
+          isErrorHandler
+        };
+        this.stack.push(entry);
         this.middlewares.push({ prefix, handler: item, isErrorHandler });
       }
     }
@@ -73,25 +87,31 @@ export class Router {
   }
 
   /**
-   * Mount another Router instance under a path prefix.
+   * Mount another Router instance under a path prefix, preserving its exact registration order.
    * @param {string} prefix 
    * @param {Router} subRouter 
    */
   mount(prefix, subRouter) {
-    // 1. Inherit sub-router middlewares with prefixed path
-    for (const mw of subRouter.middlewares) {
-      const fullPrefix = joinPaths(prefix, mw.prefix);
-      this.middlewares.push({
-        prefix: fullPrefix,
-        handler: mw.handler,
-        isErrorHandler: mw.isErrorHandler
-      });
-    }
-
-    // 2. Inherit sub-router routes with prefixed path
-    for (const route of subRouter.routes) {
-      const fullPath = joinPaths(prefix, route.path);
-      this.add(route.method, fullPath, ...route.handlers);
+    for (const entry of subRouter.stack) {
+      if (entry.type === 'middleware') {
+        const fullPrefix = joinPaths(prefix, entry.prefix);
+        const mwEntry = {
+          type: 'middleware',
+          id: ++this._seq,
+          prefix: fullPrefix,
+          handler: entry.handler,
+          isErrorHandler: entry.isErrorHandler
+        };
+        this.stack.push(mwEntry);
+        this.middlewares.push({
+          prefix: fullPrefix,
+          handler: entry.handler,
+          isErrorHandler: entry.isErrorHandler
+        });
+      } else if (entry.type === 'route') {
+        const fullPath = joinPaths(prefix, entry.path);
+        this.add(entry.method, fullPath, ...entry.handlers);
+      }
     }
 
     return this;
@@ -114,9 +134,19 @@ export class Router {
       throw new TypeError(`Route "${upperMethod} ${path}" requires at least one handler function`);
     }
 
-    const trie = this.trees.get(upperMethod);
-    trie.insert(path, flatHandlers);
+    const routeEntry = {
+      type: 'route',
+      id: ++this._seq,
+      method: upperMethod,
+      path,
+      handlers: flatHandlers,
+      params: {}
+    };
 
+    const trie = this.trees.get(upperMethod);
+    trie.insert(path, flatHandlers, routeEntry);
+
+    this.stack.push(routeEntry);
     this.routes.push({
       method: upperMethod,
       path,
@@ -127,33 +157,64 @@ export class Router {
   }
 
   /**
-   * Find matching handlers and route params for an incoming request.
-   * Includes router-scoped middlewares matching the path.
+   * Resolve execution pipeline (middleware, route handlers, error handlers) in unified registration order.
    * @param {string} method 
    * @param {string} pathname 
-   * @returns {{ handlers: Function[], params: Record<string, string> } | null}
    */
-  find(method, pathname) {
+  resolve(method, pathname) {
     const upperMethod = (method || 'GET').toUpperCase();
     const trie = this.trees.get(upperMethod);
-    if (!trie) return null;
+    const match = trie ? trie.search(pathname) : null;
+    const matchedRouteEntries = new Set(match?.routeEntries || []);
 
-    const match = trie.search(pathname);
-    if (!match) return null;
+    const pipeline = [];
+    const errorHandlers = [];
 
-    // Collect matching router middlewares
-    const routerMw = [];
-    for (const mw of this.middlewares) {
-      if (!mw.isErrorHandler) {
-        if (mw.prefix === '/' || pathname === mw.prefix || pathname.startsWith(mw.prefix + '/')) {
-          routerMw.push(mw.handler);
+    for (const entry of this.stack) {
+      if (entry.type === 'middleware') {
+        const matchesPrefix = entry.prefix === '/' || pathname === entry.prefix || pathname.startsWith(entry.prefix + '/');
+        if (!matchesPrefix) continue;
+
+        if (entry.isErrorHandler) {
+          errorHandlers.push({ prefix: entry.prefix, handler: entry.handler });
+        } else {
+          pipeline.push({ prefix: entry.prefix, handler: entry.handler });
+        }
+      } else if (entry.type === 'route') {
+        if (matchedRouteEntries.has(entry)) {
+          for (const handler of entry.handlers) {
+            if (handler.length === 4) {
+              errorHandlers.push({ prefix: '', handler, params: entry.params });
+            } else {
+              pipeline.push({ prefix: '', handler, params: entry.params });
+            }
+          }
         }
       }
     }
 
     return {
-      handlers: [...routerMw, ...match.handlers],
-      params: match.params
+      isRouteMatched: Boolean(match),
+      params: match ? match.params : {},
+      pipeline,
+      errorHandlers
+    };
+  }
+
+  /**
+   * Find matching handlers and route params for an incoming request.
+   * Preserves unified registration order between router middlewares and route handlers.
+   * @param {string} method 
+   * @param {string} pathname 
+   * @returns {{ handlers: Function[], params: Record<string, string> } | null}
+   */
+  find(method, pathname) {
+    const { isRouteMatched, params, pipeline } = this.resolve(method, pathname);
+    if (!isRouteMatched) return null;
+
+    return {
+      handlers: pipeline.map(item => item.handler),
+      params
     };
   }
 

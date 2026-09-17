@@ -83,15 +83,42 @@ export function decorateRequest(req, params = {}, parsedUrl) {
 
   // Cached body storage
   let _bodyBufferPromise = null;
+  let _bodyBuffer = null;
+  let _activeLimit = Infinity;
 
   /**
    * Read raw request body as Buffer with a size limit.
-   * Emits HTTP 413 Payload Too Large error on overflow.
+   * Emits HTTP 413 Payload Too Large error on overflow, even for cached reads.
    * @param {number} limit Maximum allowed bytes
    * @returns {Promise<Buffer>}
    */
   req.buffer = function(limit = DEFAULT_BODY_LIMIT) {
-    if (_bodyBufferPromise) return _bodyBufferPromise;
+    if (_bodyBuffer !== null) {
+      if (_bodyBuffer.length > limit) {
+        const err = new Error(`Payload Too Large: exceeded limit of ${limit} bytes`);
+        err.statusCode = 413;
+        err.status = 413;
+        return Promise.reject(err);
+      }
+      return Promise.resolve(_bodyBuffer);
+    }
+
+    if (_bodyBufferPromise !== null) {
+      if (limit < _activeLimit) {
+        _activeLimit = limit;
+      }
+      return _bodyBufferPromise.then((buf) => {
+        if (buf.length > limit) {
+          const err = new Error(`Payload Too Large: exceeded limit of ${limit} bytes`);
+          err.statusCode = 413;
+          err.status = 413;
+          throw err;
+        }
+        return buf;
+      });
+    }
+
+    _activeLimit = limit;
 
     _bodyBufferPromise = new Promise((resolve, reject) => {
       const chunks = [];
@@ -101,13 +128,13 @@ export function decorateRequest(req, params = {}, parsedUrl) {
       const onData = (chunk) => {
         if (exceeded) return;
         totalSize += chunk.length;
-        if (totalSize > limit) {
+        if (totalSize > _activeLimit) {
           exceeded = true;
           req.removeListener('data', onData);
           req.removeListener('end', onEnd);
           req.removeListener('error', onError);
           req.resume(); // drain remaining stream so socket does not block
-          const err = new Error(`Payload Too Large: exceeded limit of ${limit} bytes`);
+          const err = new Error(`Payload Too Large: exceeded limit of ${_activeLimit} bytes`);
           err.statusCode = 413;
           err.status = 413;
           reject(err);
@@ -118,7 +145,8 @@ export function decorateRequest(req, params = {}, parsedUrl) {
 
       const onEnd = () => {
         if (!exceeded) {
-          resolve(Buffer.concat(chunks));
+          _bodyBuffer = Buffer.concat(chunks);
+          resolve(_bodyBuffer);
         }
       };
 
@@ -148,20 +176,26 @@ export function decorateRequest(req, params = {}, parsedUrl) {
 
   /**
    * Parse incoming JSON request body.
+   * Enforces requested limit even when body was previously cached.
    * @param {number} limit 
    * @returns {Promise<any>}
    */
   req.json = async function(limit = DEFAULT_BODY_LIMIT) {
-    if (req.body !== undefined) return req.body;
-    const raw = await req.text(limit);
+    const buf = await req.buffer(limit);
+    if (req.body !== undefined && req._bodyFormat === 'json') {
+      return req.body;
+    }
+    const raw = buf.toString('utf-8');
     if (!raw || raw.trim() === '') {
       req.body = {};
+      req._bodyFormat = 'json';
       return req.body;
     }
     try {
       req.body = JSON.parse(raw);
+      req._bodyFormat = 'json';
       return req.body;
-    } catch (err) {
+    } catch {
       const parseError = new Error('Invalid JSON payload');
       parseError.statusCode = 400;
       throw parseError;
@@ -170,18 +204,24 @@ export function decorateRequest(req, params = {}, parsedUrl) {
 
   /**
    * Parse incoming URL-encoded form body.
+   * Enforces requested limit even when body was previously cached.
    * @param {number} limit 
    * @returns {Promise<Record<string, string|string[]>>}
    */
   req.urlencoded = async function(limit = DEFAULT_BODY_LIMIT) {
-    if (req.body !== undefined) return req.body;
-    const raw = await req.text(limit);
+    const buf = await req.buffer(limit);
+    if (req.body !== undefined && req._bodyFormat === 'urlencoded') {
+      return req.body;
+    }
+    const raw = buf.toString('utf-8');
     if (!raw || raw.trim() === '') {
       req.body = {};
+      req._bodyFormat = 'urlencoded';
       return req.body;
     }
     const params = new URLSearchParams(raw);
     req.body = parseQuery(params);
+    req._bodyFormat = 'urlencoded';
     return req.body;
   };
 
