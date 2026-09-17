@@ -121,6 +121,9 @@ export class BareWeb {
 
       const item = pipeline[index++];
       req.baseUrl = item.prefix === '/' ? '' : item.prefix;
+      if (item.params) {
+        req.params = { ...(req.params || {}), ...item.params };
+      }
       const fn = item.handler;
 
       try {
@@ -143,6 +146,9 @@ export class BareWeb {
           }
           const item = errorHandlers[errIdx++];
           req.baseUrl = item.prefix === '/' ? '' : item.prefix;
+          if (item.params) {
+            req.params = { ...(req.params || {}), ...item.params };
+          }
           try {
             const resVal = item.handler(e || err, req, res, nextErr);
             if (resVal && typeof resVal.then === 'function') {
