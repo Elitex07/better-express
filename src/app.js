@@ -92,11 +92,11 @@ export class BareWeb {
     }
 
     const pathname = parsedUrl.pathname;
-    const { isRouteMatched, params, pipeline, errorHandlers } = this.router.resolve(req.method, pathname);
+    const { isRouteMatched, params, pipeline, errorHandlers, allowedMethods } = this.router.resolve(req.method, pathname);
 
     decorateRequest(req, params, parsedUrl, this._requestOptions);
 
-    await runPipeline(req, res, pipeline, errorHandlers, isRouteMatched);
+    await runPipeline(req, res, pipeline, errorHandlers, isRouteMatched, allowedMethods);
   }
 
   /**

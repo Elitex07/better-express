@@ -2,6 +2,8 @@ import { Trie } from './trie.js';
 
 export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'];
 
+const EMPTY_METHODS = Object.freeze([]);
+
 export function joinPaths(p1 = '', p2 = '') {
   if (!p1 || p1 === '/') return p2.startsWith('/') ? p2 : `/${p2}`;
   if (!p2 || p2 === '/') return p1.startsWith('/') ? p1 : `/${p1}`;
@@ -143,8 +145,21 @@ export class Router {
    */
   resolve(method, pathname) {
     const upperMethod = (method || 'GET').toUpperCase();
-    const trie = this.trees.get(upperMethod);
-    const match = trie ? trie.search(pathname) : null;
+    let trie = this.trees.get(upperMethod);
+    let match = trie ? trie.search(pathname) : null;
+
+    // HEAD falls back to GET (Node discards the body on HEAD automatically)
+    if (!match && upperMethod === 'HEAD') {
+      trie = this.trees.get('GET');
+      match = trie ? trie.search(pathname) : null;
+    }
+
+    // No route for this method: find which methods *do* match so the caller can send 405 / OPTIONS
+    let allowedMethods = EMPTY_METHODS;
+    if (!match) {
+      allowedMethods = this.allowedMethodsFor(pathname);
+    }
+
     const matchedRouteEntries = new Set(match?.routeEntries || []);
 
     const pipeline = [];
@@ -177,8 +192,24 @@ export class Router {
       isRouteMatched: Boolean(match),
       params: match ? match.params : {},
       pipeline,
-      errorHandlers
+      errorHandlers,
+      allowedMethods
     };
+  }
+
+  /**
+   * List HTTP methods that have a route matching `pathname` (used for 405 Allow / automatic OPTIONS).
+   * Only called on the miss path, so the extra trie walks never touch matched requests.
+   * @param {string} pathname
+   * @returns {string[]}
+   */
+  allowedMethodsFor(pathname) {
+    const allowed = [];
+    for (const [m, tree] of this.trees) {
+      if (tree.search(pathname)) allowed.push(m);
+    }
+    if (allowed.includes('GET') && !allowed.includes('HEAD')) allowed.push('HEAD');
+    return allowed;
   }
 
   /**
