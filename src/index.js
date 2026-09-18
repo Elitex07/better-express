@@ -1,8 +1,8 @@
 import { BareWeb, createApp } from './app.js';
 import { Router } from './router.js';
 import { Trie } from './trie.js';
-import { decorateRequest, parseQuery, compileTrustProxy, DEFAULT_BODY_LIMIT } from './request.js';
-import { decorateResponse, MIME_TYPES } from './response.js';
+import { BareWebRequest, decorateRequest, parseQuery, compileTrustProxy, DEFAULT_BODY_LIMIT } from './request.js';
+import { BareWebResponse, decorateResponse, MIME_TYPES } from './response.js';
 import { runPipeline, defaultErrorHandler, cors, serveStatic, json, urlencoded } from './middleware.js';
 
 // Attach static helpers to factory function (Express-like ergonomics)
@@ -19,10 +19,12 @@ export {
   createApp,
   Router,
   Trie,
+  BareWebRequest,
   decorateRequest,
   parseQuery,
   compileTrustProxy,
   DEFAULT_BODY_LIMIT,
+  BareWebResponse,
   decorateResponse,
   MIME_TYPES,
   runPipeline,
