@@ -25,15 +25,6 @@ export class Router {
       this.trees.set(method, new Trie(options));
     }
 
-    /** @type {Array<{ method: string, path: string, handlers: Function[] }>} */
-    this.routes = [];
-
-    /**
-     * Router-level middlewares (maintained for backwards compatibility).
-     * @type {Array<{ prefix: string, handler: Function, isErrorHandler: boolean }>}
-     */
-    this.middlewares = [];
-
     /**
      * Unified registration sequence of all middlewares and routes.
      * @type {Array<object>}
@@ -79,7 +70,6 @@ export class Router {
           isErrorHandler
         };
         this.stack.push(entry);
-        this.middlewares.push({ prefix, handler: item, isErrorHandler });
       }
     }
 
@@ -103,11 +93,6 @@ export class Router {
           isErrorHandler: entry.isErrorHandler
         };
         this.stack.push(mwEntry);
-        this.middlewares.push({
-          prefix: fullPrefix,
-          handler: entry.handler,
-          isErrorHandler: entry.isErrorHandler
-        });
       } else if (entry.type === 'route') {
         const fullPath = joinPaths(prefix, entry.path);
         this.add(entry.method, fullPath, ...entry.handlers);
@@ -147,11 +132,6 @@ export class Router {
     trie.insert(path, flatHandlers, routeEntry);
 
     this.stack.push(routeEntry);
-    this.routes.push({
-      method: upperMethod,
-      path,
-      handlers: flatHandlers
-    });
 
     return this;
   }
@@ -202,8 +182,8 @@ export class Router {
   }
 
   /**
-   * Find matching handlers and route params for an incoming request.
-   * Preserves unified registration order between router middlewares and route handlers.
+   * Convenience wrapper over resolve(): flat handler list + params, or null when no route matches.
+   * Mainly useful for tests and introspection.
    * @param {string} method 
    * @param {string} pathname 
    * @returns {{ handlers: Function[], params: Record<string, string> } | null}

@@ -1,6 +1,6 @@
 import http from 'node:http';
-import { Router, HTTP_METHODS, joinPaths } from './router.js';
-import { MiddlewareStack, defaultErrorHandler } from './middleware.js';
+import { Router } from './router.js';
+import { runPipeline } from './middleware.js';
 import { decorateRequest } from './request.js';
 import { decorateResponse } from './response.js';
 
@@ -13,12 +13,6 @@ export class BareWeb {
     this.options = options;
     this.router = new Router(options);
     this.server = null;
-    this.middleware = {
-      use: (...args) => this.use(...args),
-      get entries() {
-        return this.router ? this.router.middlewares : [];
-      }
-    };
 
     // Bind handler so it can be passed directly as a callback
     this.handle = this.handle.bind(this);
@@ -96,81 +90,9 @@ export class BareWeb {
     const pathname = parsedUrl.pathname;
     const { isRouteMatched, params, pipeline, errorHandlers } = this.router.resolve(req.method, pathname);
 
-    // Decorate request object
     decorateRequest(req, params, parsedUrl);
 
-    let index = 0;
-
-    const next = async (err) => {
-      if (err) {
-        return handleErrors(err);
-      }
-
-      if (index >= pipeline.length) {
-        // Reached end of pipeline
-        if (!isRouteMatched && !res.writableEnded) {
-          res.status(404).json({
-            error: {
-              message: `Cannot ${req.method} ${pathname}`,
-              statusCode: 404
-            }
-          });
-        }
-        return;
-      }
-
-      const item = pipeline[index++];
-      req.baseUrl = item.prefix === '/' ? '' : item.prefix;
-      if (item.params) {
-        req.params = { ...(req.params || {}), ...item.params };
-      }
-      const fn = item.handler;
-
-      try {
-        const result = fn(req, res, next);
-        if (result && typeof result.then === 'function') {
-          await result;
-        }
-      } catch (catchedErr) {
-        await handleErrors(catchedErr);
-      }
-    };
-
-    const handleErrors = async (err) => {
-      if (errorHandlers.length > 0) {
-        let errIdx = 0;
-        const nextErr = async (e) => {
-          if (errIdx >= errorHandlers.length) {
-            defaultErrorHandler(e || err, req, res);
-            return;
-          }
-          const item = errorHandlers[errIdx++];
-          req.baseUrl = item.prefix === '/' ? '' : item.prefix;
-          if (item.params) {
-            req.params = { ...(req.params || {}), ...item.params };
-          }
-          try {
-            const resVal = item.handler(e || err, req, res, nextErr);
-            if (resVal && typeof resVal.then === 'function') {
-              await resVal;
-            }
-          } catch (unexpected) {
-            defaultErrorHandler(unexpected, req, res);
-          }
-        };
-        await nextErr(err);
-      } else {
-        defaultErrorHandler(err, req, res);
-      }
-    };
-
-    try {
-      await next();
-    } catch (err) {
-      if (!res.writableEnded) {
-        defaultErrorHandler(err, req, res);
-      }
-    }
+    await runPipeline(req, res, pipeline, errorHandlers, isRouteMatched);
   }
 
   /**
