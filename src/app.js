@@ -7,7 +7,7 @@ import { decorateResponse } from './response.js';
 export class BareWeb {
   /**
    * @param {object} [options]
-   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   * @param {number} [options.maxBacktracks] Deprecated, ignored (see Trie)
    * @param {boolean|Function|string|string[]} [options.trustProxy=false] Whether to honour
    *   X-Forwarded-For / -Proto / -Host headers (req.ip, req.protocol, req.hostname).
    *   Off by default: a client can set these headers freely, so only enable behind a proxy you control.

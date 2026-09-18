@@ -3,6 +3,7 @@ import { Trie } from './trie.js';
 export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'];
 
 const EMPTY_METHODS = Object.freeze([]);
+const EMPTY_PARAMS = Object.freeze({});
 
 export function joinPaths(p1 = '', p2 = '') {
   if (!p1 || p1 === '/') return p2.startsWith('/') ? p2 : `/${p2}`;
@@ -16,7 +17,7 @@ export function joinPaths(p1 = '', p2 = '') {
 export class Router {
   /**
    * @param {object} [options]
-   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   * @param {number} [options.maxBacktracks] Deprecated, ignored (see Trie)
    */
   constructor(options = {}) {
     this.config = options;
@@ -126,8 +127,7 @@ export class Router {
       id: ++this._seq,
       method: upperMethod,
       path,
-      handlers: flatHandlers,
-      params: {}
+      handlers: flatHandlers
     };
 
     const trie = this.trees.get(upperMethod);
@@ -146,12 +146,12 @@ export class Router {
   resolve(method, pathname) {
     const upperMethod = (method || 'GET').toUpperCase();
     let trie = this.trees.get(upperMethod);
-    let match = trie ? trie.search(pathname) : null;
+    let match = trie ? trie.lookup(pathname) : null;
 
     // HEAD falls back to GET (Node discards the body on HEAD automatically)
     if (!match && upperMethod === 'HEAD') {
       trie = this.trees.get('GET');
-      match = trie ? trie.search(pathname) : null;
+      match = trie ? trie.lookup(pathname) : null;
     }
 
     // No route for this method: find which methods *do* match so the caller can send 405 / OPTIONS
@@ -160,7 +160,18 @@ export class Router {
       allowedMethods = this.allowedMethodsFor(pathname);
     }
 
-    const matchedRouteEntries = new Set(match?.routeEntries || []);
+    // routeEntry -> params for every route definition terminating at the matched node
+    let matchedParams = null;
+    let params = EMPTY_PARAMS;
+    if (match) {
+      matchedParams = new Map();
+      params = {};
+      for (const route of match.node.routes) {
+        const routeParams = Trie.extractParams(route, match.segments, {});
+        Object.assign(params, routeParams);
+        matchedParams.set(route.routeEntry, routeParams);
+      }
+    }
 
     const pipeline = [];
     const errorHandlers = [];
@@ -175,13 +186,14 @@ export class Router {
         } else {
           pipeline.push({ prefix: entry.prefix, handler: entry.handler });
         }
-      } else if (entry.type === 'route') {
-        if (matchedRouteEntries.has(entry)) {
+      } else if (entry.type === 'route' && matchedParams !== null) {
+        const routeParams = matchedParams.get(entry);
+        if (routeParams !== undefined) {
           for (const handler of entry.handlers) {
             if (handler.length === 4) {
-              errorHandlers.push({ prefix: '', handler, params: entry.params });
+              errorHandlers.push({ prefix: '', handler, params: routeParams });
             } else {
-              pipeline.push({ prefix: '', handler, params: entry.params });
+              pipeline.push({ prefix: '', handler, params: routeParams });
             }
           }
         }
@@ -189,8 +201,8 @@ export class Router {
     }
 
     return {
-      isRouteMatched: Boolean(match),
-      params: match ? match.params : {},
+      isRouteMatched: match !== null,
+      params,
       pipeline,
       errorHandlers,
       allowedMethods
@@ -206,7 +218,7 @@ export class Router {
   allowedMethodsFor(pathname) {
     const allowed = [];
     for (const [m, tree] of this.trees) {
-      if (tree.search(pathname)) allowed.push(m);
+      if (tree.lookup(pathname)) allowed.push(m);
     }
     if (allowed.includes('GET') && !allowed.includes('HEAD')) allowed.push('HEAD');
     return allowed;
