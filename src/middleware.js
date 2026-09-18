@@ -149,32 +149,130 @@ export function defaultErrorHandler(err, req, res) {
   res.end(JSON.stringify(responsePayload));
 }
 
+function toHeaderList(value) {
+  return Array.isArray(value) ? value.join(',') : value;
+}
+
+/**
+ * Build an origin resolver from the `origin` option.
+ * @returns {{ isStatic: boolean, resolve: (reqOrigin: string|undefined, req: object) => string|false }}
+ */
+function compileOrigin(origin) {
+  if (origin === undefined || origin === true || origin === '*') {
+    return { isStatic: true, resolve: () => '*' };
+  }
+  if (origin === false) {
+    return { isStatic: true, resolve: () => false };
+  }
+  if (typeof origin === 'string') {
+    return { isStatic: true, resolve: () => origin };
+  }
+  if (origin instanceof RegExp) {
+    return { isStatic: false, resolve: (reqOrigin) => (reqOrigin && origin.test(reqOrigin) ? reqOrigin : false) };
+  }
+  if (Array.isArray(origin)) {
+    return {
+      isStatic: false,
+      resolve: (reqOrigin) => {
+        if (!reqOrigin) return false;
+        for (const o of origin) {
+          if (o instanceof RegExp ? o.test(reqOrigin) : o === reqOrigin) return reqOrigin;
+        }
+        return false;
+      }
+    };
+  }
+  if (typeof origin === 'function') {
+    return {
+      isStatic: false,
+      resolve: (reqOrigin, req) => {
+        const out = origin(reqOrigin, req);
+        if (out === true) return reqOrigin || '*';
+        return out || false;
+      }
+    };
+  }
+  throw new TypeError('cors(): unsupported "origin" option');
+}
+
 /**
  * Built-in zero-dependency CORS middleware.
  * @param {object} [options]
+ * @param {string|boolean|RegExp|Array<string|RegExp>|Function} [options.origin='*']
+ *   Allowed origin(s). Non-static forms reflect the request Origin when it matches and add `Vary: Origin`.
+ *   A function receives (requestOrigin, req) and returns a string, true (reflect) or false.
+ * @param {string|string[]} [options.methods='GET,HEAD,PUT,PATCH,POST,DELETE']
+ * @param {string|string[]} [options.headers] Allowed request headers; defaults to reflecting
+ *   Access-Control-Request-Headers on preflight.
+ * @param {string|string[]} [options.exposedHeaders] Access-Control-Expose-Headers
+ * @param {boolean} [options.credentials=false]
+ * @param {number} [options.maxAge]
+ * @param {number} [options.optionsSuccessStatus=204]
+ * @param {boolean} [options.preflightContinue=false] Pass OPTIONS to the next handler instead of ending it.
  */
 export function cors(options = {}) {
-  const origin = options.origin || '*';
-  const methods = options.methods || 'GET,HEAD,PUT,PATCH,POST,DELETE';
-  const headers = options.headers || 'Content-Type,Authorization';
-  const credentials = options.credentials ? 'true' : null;
-  const maxAge = options.maxAge ? String(options.maxAge) : null;
+  const { isStatic, resolve } = compileOrigin(options.origin);
+  const methods = toHeaderList(options.methods || 'GET,HEAD,PUT,PATCH,POST,DELETE');
+  const allowedHeaders = options.headers ? toHeaderList(options.headers) : null;
+  const exposedHeaders = options.exposedHeaders ? toHeaderList(options.exposedHeaders) : null;
+  const credentials = Boolean(options.credentials);
+  const maxAge = options.maxAge !== undefined ? String(options.maxAge) : null;
+  const optionsSuccessStatus = options.optionsSuccessStatus || 204;
+  const preflightContinue = Boolean(options.preflightContinue);
+
+  if (credentials && isStatic && resolve() === '*') {
+    throw new TypeError('cors(): credentials: true cannot be combined with origin "*" (browsers reject it); list explicit origins instead');
+  }
 
   return (req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Methods', methods);
-    res.setHeader('Access-Control-Allow-Headers', headers);
-    if (credentials) res.setHeader('Access-Control-Allow-Credentials', credentials);
-    if (maxAge) res.setHeader('Access-Control-Max-Age', maxAge);
+    const allowOrigin = resolve(req.headers.origin, req);
+
+    if (!isStatic) {
+      // Response depends on the request Origin; tell caches so
+      appendVary(res, 'Origin');
+    }
+
+    if (allowOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', allowOrigin);
+      if (credentials) res.setHeader('Access-Control-Allow-Credentials', 'true');
+      if (exposedHeaders) res.setHeader('Access-Control-Expose-Headers', exposedHeaders);
+    }
 
     if (req.method === 'OPTIONS') {
-      res.statusCode = 204;
+      if (allowOrigin) {
+        res.setHeader('Access-Control-Allow-Methods', methods);
+        const reqHeaders = req.headers['access-control-request-headers'];
+        if (allowedHeaders) {
+          res.setHeader('Access-Control-Allow-Headers', allowedHeaders);
+        } else if (reqHeaders) {
+          res.setHeader('Access-Control-Allow-Headers', reqHeaders);
+          appendVary(res, 'Access-Control-Request-Headers');
+        }
+        if (maxAge) res.setHeader('Access-Control-Max-Age', maxAge);
+      }
+      if (preflightContinue) return next();
+      res.statusCode = optionsSuccessStatus;
       res.setHeader('Content-Length', '0');
       return res.end();
     }
 
     next();
   };
+}
+
+/** Append a field to the Vary header without duplicating it. */
+function appendVary(res, field) {
+  const prev = res.getHeader('Vary');
+  if (!prev) {
+    res.setHeader('Vary', field);
+    return;
+  }
+  const current = String(prev);
+  if (current === '*') return;
+  const fields = current.split(',').map((f) => f.trim().toLowerCase());
+  if (!fields.includes(field.toLowerCase())) {
+    res.setHeader('Vary', `${current}, ${field}`);
+  }
 }
 
 /**
