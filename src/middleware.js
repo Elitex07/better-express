@@ -4,6 +4,18 @@ import fs from 'node:fs';
 import { DEFAULT_BODY_LIMIT } from './request.js';
 
 /**
+ * Route handlers see their own route's params merged over whatever is already on req.params.
+ * In the common single-route case the router hands the same object it already assigned to
+ * req.params, so no allocation happens.
+ */
+function applyParams(req, item) {
+  const p = item.params;
+  if (p !== null && p !== undefined && p !== req.params) {
+    req.params = { ...req.params, ...p };
+  }
+}
+
+/**
  * Execute a resolved pipeline of middlewares and route handlers in exact registration sequence.
  * Shared by BareWeb.handle; the single place where next()/error propagation semantics live.
  * @param {object} req
@@ -30,9 +42,7 @@ export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatc
       }
       const item = errorHandlers[errIdx++];
       req.baseUrl = item.prefix === '/' ? '' : item.prefix;
-      if (item.params) {
-        req.params = { ...(req.params || {}), ...item.params };
-      }
+      applyParams(req, item);
       try {
         const resVal = item.handler(current, req, res, nextErr);
         if (resVal && typeof resVal.then === 'function') {
@@ -59,9 +69,7 @@ export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatc
 
     const item = pipeline[index++];
     req.baseUrl = item.prefix === '/' ? '' : item.prefix;
-    if (item.params) {
-      req.params = { ...(req.params || {}), ...item.params };
-    }
+    applyParams(req, item);
 
     try {
       const result = item.handler(req, res, next);

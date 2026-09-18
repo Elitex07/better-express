@@ -5,6 +5,12 @@ export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS',
 const EMPTY_METHODS = Object.freeze([]);
 const EMPTY_PARAMS = Object.freeze({});
 
+function prefixMatches(prefix, pathname) {
+  if (prefix === '/') return true;
+  if (!pathname.startsWith(prefix)) return false;
+  return pathname.length === prefix.length || pathname.charCodeAt(prefix.length) === 47 /* / */;
+}
+
 export function joinPaths(p1 = '', p2 = '') {
   if (!p1 || p1 === '/') return p2.startsWith('/') ? p2 : `/${p2}`;
   if (!p2 || p2 === '/') return p1.startsWith('/') ? p1 : `/${p1}`;
@@ -34,6 +40,13 @@ export class Router {
      */
     this.stack = [];
     this._seq = 0;
+
+    /**
+     * Bumped on every registration; cached per-node plans compare against it so a
+     * route/middleware added after the first request is still picked up.
+     */
+    this._version = 0;
+    this._unmatchedPlan = null;
   }
 
   /**
@@ -73,6 +86,7 @@ export class Router {
           isErrorHandler
         };
         this.stack.push(entry);
+        this._version++;
       }
     }
 
@@ -96,6 +110,7 @@ export class Router {
           isErrorHandler: entry.isErrorHandler
         };
         this.stack.push(mwEntry);
+        this._version++;
       } else if (entry.type === 'route') {
         const fullPath = joinPaths(prefix, entry.path);
         this.add(entry.method, fullPath, ...entry.handlers);
@@ -134,14 +149,19 @@ export class Router {
     trie.insert(path, flatHandlers, routeEntry);
 
     this.stack.push(routeEntry);
+    this._version++;
 
     return this;
   }
 
   /**
    * Resolve execution pipeline (middleware, route handlers, error handlers) in unified registration order.
-   * @param {string} method 
-   * @param {string} pathname 
+   *
+   * The registration-order interleaving of middleware and the routes terminating at a trie node
+   * is fixed for that node, so it is computed once per node (see _planFor) and only the
+   * per-request pieces - middleware prefix filtering and route params - are done here.
+   * @param {string} method
+   * @param {string} pathname
    */
   resolve(method, pathname) {
     const upperMethod = (method || 'GET').toUpperCase();
@@ -154,59 +174,118 @@ export class Router {
       match = trie ? trie.lookup(pathname) : null;
     }
 
-    // No route for this method: find which methods *do* match so the caller can send 405 / OPTIONS
-    let allowedMethods = EMPTY_METHODS;
-    if (!match) {
-      allowedMethods = this.allowedMethodsFor(pathname);
-    }
-
-    // routeEntry -> params for every route definition terminating at the matched node
-    let matchedParams = null;
-    let params = EMPTY_PARAMS;
-    if (match) {
-      matchedParams = new Map();
-      params = {};
-      for (const route of match.node.routes) {
-        const routeParams = Trie.extractParams(route, match.segments, {});
-        Object.assign(params, routeParams);
-        matchedParams.set(route.routeEntry, routeParams);
-      }
-    }
-
     const pipeline = [];
     const errorHandlers = [];
 
-    for (const entry of this.stack) {
-      if (entry.type === 'middleware') {
-        const matchesPrefix = entry.prefix === '/' || pathname === entry.prefix || pathname.startsWith(entry.prefix + '/');
-        if (!matchesPrefix) continue;
+    if (match === null) {
+      // No route for this method: find which methods *do* match so the caller can send 405 / OPTIONS
+      const plan = this._unmatchedPlanFor();
+      this._applyMiddleware(plan.items, pathname, pipeline, errorHandlers);
+      return {
+        isRouteMatched: false,
+        params: EMPTY_PARAMS,
+        pipeline,
+        errorHandlers,
+        allowedMethods: this.allowedMethodsFor(pathname)
+      };
+    }
 
-        if (entry.isErrorHandler) {
-          errorHandlers.push({ prefix: entry.prefix, handler: entry.handler });
-        } else {
-          pipeline.push({ prefix: entry.prefix, handler: entry.handler });
-        }
-      } else if (entry.type === 'route' && matchedParams !== null) {
-        const routeParams = matchedParams.get(entry);
-        if (routeParams !== undefined) {
-          for (const handler of entry.handlers) {
-            if (handler.length === 4) {
-              errorHandlers.push({ prefix: '', handler, params: routeParams });
-            } else {
-              pipeline.push({ prefix: '', handler, params: routeParams });
-            }
-          }
-        }
+    const { node, segments } = match;
+    const plan = this._planFor(node);
+
+    // Per-route params (routes sharing a node may declare different param names)
+    const routes = node.routes;
+    let params;
+    let routeParams;
+    if (routes.length === 1) {
+      params = routeParams = Trie.extractParams(routes[0], segments, {});
+    } else {
+      params = {};
+      routeParams = new Array(routes.length);
+      for (let i = 0; i < routes.length; i++) {
+        routeParams[i] = Trie.extractParams(routes[i], segments, {});
+        Object.assign(params, routeParams[i]);
+      }
+    }
+
+    const items = plan.items;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.routeIdx === -1) {
+        if (!prefixMatches(item.prefix, pathname)) continue;
+        (item.isErrorHandler ? errorHandlers : pipeline).push(item);
+      } else {
+        const p = routes.length === 1 ? routeParams : routeParams[item.routeIdx];
+        (item.isErrorHandler ? errorHandlers : pipeline).push({ prefix: '', handler: item.handler, params: p });
       }
     }
 
     return {
-      isRouteMatched: match !== null,
+      isRouteMatched: true,
       params,
       pipeline,
       errorHandlers,
-      allowedMethods
+      allowedMethods: EMPTY_METHODS
     };
+  }
+
+  /**
+   * Push middleware items whose prefix matches the pathname (used on the unmatched path).
+   */
+  _applyMiddleware(items, pathname, pipeline, errorHandlers) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!prefixMatches(item.prefix, pathname)) continue;
+      (item.isErrorHandler ? errorHandlers : pipeline).push(item);
+    }
+  }
+
+  /**
+   * Build (or fetch the cached) ordered plan for a trie node: every middleware entry plus the
+   * handlers of each route terminating at the node, in registration order. Middleware items are
+   * shared, immutable objects reused across requests; route items record which route's params apply.
+   * @param {import('./trie.js').TrieNode} node
+   */
+  _planFor(node) {
+    const cached = node.plan;
+    if (cached !== null && cached.version === this._version) return cached;
+
+    const routeIndex = new Map();
+    for (let i = 0; i < node.routes.length; i++) {
+      routeIndex.set(node.routes[i].routeEntry, i);
+    }
+
+    const items = [];
+    for (const entry of this.stack) {
+      if (entry.type === 'middleware') {
+        items.push({ prefix: entry.prefix, handler: entry.handler, params: null, isErrorHandler: entry.isErrorHandler, routeIdx: -1 });
+      } else {
+        const idx = routeIndex.get(entry);
+        if (idx === undefined) continue;
+        for (const handler of entry.handlers) {
+          items.push({ prefix: '', handler, params: null, isErrorHandler: handler.length === 4, routeIdx: idx });
+        }
+      }
+    }
+
+    const plan = { version: this._version, items };
+    node.plan = plan;
+    return plan;
+  }
+
+  _unmatchedPlanFor() {
+    const cached = this._unmatchedPlan;
+    if (cached !== null && cached.version === this._version) return cached;
+
+    const items = [];
+    for (const entry of this.stack) {
+      if (entry.type === 'middleware') {
+        items.push({ prefix: entry.prefix, handler: entry.handler, params: null, isErrorHandler: entry.isErrorHandler, routeIdx: -1 });
+      }
+    }
+    const plan = { version: this._version, items };
+    this._unmatchedPlan = plan;
+    return plan;
   }
 
   /**

@@ -242,3 +242,53 @@ describe('Router Method Dispatching & Sub-Routers', () => {
     );
   });
 });
+
+describe('Router resolve() plan caching', () => {
+  it('picks up middleware and routes registered after the first resolve', () => {
+    const router = new Router();
+    const log = [];
+    router.get('/a', () => log.push('a'));
+
+    let r = router.resolve('GET', '/a');
+    assert.strictEqual(r.pipeline.length, 1);
+
+    router.use((req, res, next) => log.push('mw'));
+    router.get('/a', () => log.push('a2'));
+
+    r = router.resolve('GET', '/a');
+    assert.strictEqual(r.pipeline.length, 3);
+    // middleware registered after the first handler must run between them, not before
+    r.pipeline.forEach(item => item.handler());
+    assert.deepStrictEqual(log, ['a', 'mw', 'a2']);
+
+    // unmatched path also sees the new middleware
+    r = router.resolve('GET', '/nothing');
+    assert.strictEqual(r.isRouteMatched, false);
+    assert.strictEqual(r.pipeline.length, 1);
+  });
+
+  it('matches middleware prefixes on segment boundaries only', () => {
+    const router = new Router();
+    const mw = (req, res, next) => next();
+    router.use('/api', mw);
+    router.get('/api', () => {});
+    router.get('/api/x', () => {});
+    router.get('/apix', () => {});
+
+    assert.strictEqual(router.resolve('GET', '/api').pipeline.length, 2);
+    assert.strictEqual(router.resolve('GET', '/api/x').pipeline.length, 2);
+    assert.strictEqual(router.resolve('GET', '/apix').pipeline.length, 1);
+  });
+
+  it('keeps distinct params per route when two routes share a trie node', () => {
+    const router = new Router();
+    const h1 = () => {};
+    const h2 = () => {};
+    router.get('/items/:id', h1);
+    router.get('/items/:name', h2);
+    const r = router.resolve('GET', '/items/7');
+    assert.deepStrictEqual(r.params, { id: '7', name: '7' });
+    assert.deepStrictEqual(r.pipeline[0].params, { id: '7' });
+    assert.deepStrictEqual(r.pipeline[1].params, { name: '7' });
+  });
+});
