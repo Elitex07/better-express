@@ -1,17 +1,21 @@
 import http from 'node:http';
 import { Router } from './router.js';
 import { runPipeline } from './middleware.js';
-import { decorateRequest } from './request.js';
+import { decorateRequest, compileTrustProxy } from './request.js';
 import { decorateResponse } from './response.js';
 
 export class BareWeb {
   /**
    * @param {object} [options]
    * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   * @param {boolean|Function|string|string[]} [options.trustProxy=false] Whether to honour
+   *   X-Forwarded-For / -Proto / -Host headers (req.ip, req.protocol, req.hostname).
+   *   Off by default: a client can set these headers freely, so only enable behind a proxy you control.
    */
   constructor(options = {}) {
     this.options = options;
     this.router = new Router(options);
+    this._requestOptions = { trustProxy: compileTrustProxy(options.trustProxy) };
     this.server = null;
 
     // Bind handler so it can be passed directly as a callback
@@ -90,7 +94,7 @@ export class BareWeb {
     const pathname = parsedUrl.pathname;
     const { isRouteMatched, params, pipeline, errorHandlers } = this.router.resolve(req.method, pathname);
 
-    decorateRequest(req, params, parsedUrl);
+    decorateRequest(req, params, parsedUrl, this._requestOptions);
 
     await runPipeline(req, res, pipeline, errorHandlers, isRouteMatched);
   }

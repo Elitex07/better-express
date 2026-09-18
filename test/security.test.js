@@ -68,3 +68,62 @@ describe('Error handler hardening', () => {
     }
   });
 });
+
+describe('trustProxy', () => {
+  const spoofHeaders = {
+    'x-forwarded-for': '203.0.113.9, 10.0.0.1',
+    'x-forwarded-proto': 'https',
+    'x-forwarded-host': 'evil.example'
+  };
+  const echo = (app) => {
+    app.get('/whoami', (req, res) => {
+      res.json({ ip: req.ip, protocol: req.protocol, secure: req.secure, hostname: req.hostname });
+    });
+  };
+
+  it('ignores X-Forwarded-* by default', async () => {
+    const ctx = await startApp(echo);
+    try {
+      const res = await fetch(`${ctx.baseUrl}/whoami`, { headers: spoofHeaders });
+      const body = await res.json();
+      assert.equal(body.ip, '127.0.0.1');
+      assert.equal(body.protocol, 'http');
+      assert.equal(body.secure, false);
+      assert.equal(body.hostname, '127.0.0.1');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('honours X-Forwarded-* when trustProxy: true', async () => {
+    const ctx = await startApp(echo, { trustProxy: true });
+    try {
+      const res = await fetch(`${ctx.baseUrl}/whoami`, { headers: spoofHeaders });
+      const body = await res.json();
+      assert.equal(body.ip, '203.0.113.9');
+      assert.equal(body.protocol, 'https');
+      assert.equal(body.secure, true);
+      assert.equal(body.hostname, 'evil.example');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('supports loopback shortcut and custom predicate', async () => {
+    const ctx = await startApp(echo, { trustProxy: 'loopback' });
+    try {
+      const res = await fetch(`${ctx.baseUrl}/whoami`, { headers: spoofHeaders });
+      assert.equal((await res.json()).ip, '203.0.113.9');
+    } finally {
+      await ctx.close();
+    }
+
+    const ctx2 = await startApp(echo, { trustProxy: (addr) => addr === '192.0.2.1' });
+    try {
+      const res = await fetch(`${ctx2.baseUrl}/whoami`, { headers: spoofHeaders });
+      assert.equal((await res.json()).ip, '127.0.0.1');
+    } finally {
+      await ctx2.close();
+    }
+  });
+});

@@ -31,18 +31,62 @@ export function parseQuery(searchParams) {
   return query;
 }
 
-export function decorateRequest(req, params = {}, parsedUrl) {
+/**
+ * Normalise the `trustProxy` option into a predicate over the socket's remote address.
+ * - false/undefined: never trust X-Forwarded-* (default; safe for direct exposure)
+ * - true: always trust
+ * - function(remoteAddress): custom decision
+ * - string | string[]: trust when remoteAddress is in the list ('loopback' is a shortcut)
+ * @param {boolean|Function|string|string[]} [trustProxy]
+ * @returns {(remoteAddress: string) => boolean}
+ */
+export function compileTrustProxy(trustProxy) {
+  if (trustProxy === true) return () => true;
+  if (typeof trustProxy === 'function') return trustProxy;
+  if (typeof trustProxy === 'string' || Array.isArray(trustProxy)) {
+    const list = new Set(
+      (Array.isArray(trustProxy) ? trustProxy : trustProxy.split(','))
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+    if (list.has('loopback')) {
+      list.add('127.0.0.1');
+      list.add('::1');
+      list.add('::ffff:127.0.0.1');
+    }
+    return (addr) => list.has(addr);
+  }
+  return () => false;
+}
+
+const NEVER_TRUST = () => false;
+
+/**
+ * @param {import('node:http').IncomingMessage} req
+ * @param {Record<string, string>} params
+ * @param {URL} parsedUrl
+ * @param {object} [options]
+ * @param {(remoteAddress: string) => boolean} [options.trustProxy] compiled predicate (see compileTrustProxy)
+ */
+export function decorateRequest(req, params = {}, parsedUrl, options = {}) {
   req.params = params;
   req.path = parsedUrl.pathname;
   req.query = parseQuery(parsedUrl.searchParams);
   req.searchParams = parsedUrl.searchParams;
 
-  // Client IP address
-  req.ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket?.remoteAddress || '';
+  const remoteAddress = req.socket?.remoteAddress || '';
+  const trust = options.trustProxy || NEVER_TRUST;
+  const trusted = trust(remoteAddress);
+
+  // Client IP address: only honour X-Forwarded-For from a trusted proxy
+  const xff = trusted ? req.headers['x-forwarded-for'] : undefined;
+  req.ip = (xff && xff.split(',')[0].trim()) || remoteAddress;
 
   // Hostname & Protocol
-  req.hostname = parsedUrl.hostname;
-  req.protocol = req.headers['x-forwarded-proto'] || (req.socket?.encrypted ? 'https' : 'http');
+  const xfHost = trusted ? req.headers['x-forwarded-host'] : undefined;
+  req.hostname = (xfHost && xfHost.split(',')[0].trim()) || parsedUrl.hostname;
+  const xfProto = trusted ? req.headers['x-forwarded-proto'] : undefined;
+  req.protocol = (xfProto && xfProto.split(',')[0].trim()) || (req.socket?.encrypted ? 'https' : 'http');
   req.secure = req.protocol === 'https';
 
   // AJAX / XHR helper
