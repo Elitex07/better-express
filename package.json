@@ -29,7 +29,11 @@
   "author": "BareWeb Team",
   "license": "MIT",
   "devDependencies": {
+    "@koa/router": "^15.7.0",
     "autocannon": "^8.0.0",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "fastify": "^5.12.5",
+    "koa": "^3.2.1",
+    "koa-bodyparser": "^4.4.1"
   }
 }
