@@ -3,154 +3,85 @@ import fs from 'node:fs';
 import { DEFAULT_BODY_LIMIT } from './request.js';
 
 /**
- * Asynchronous middleware runner supporting standard middleware and path prefix filtering.
+ * Execute a resolved pipeline of middlewares and route handlers in exact registration sequence.
+ * Shared by BareWeb.handle; the single place where next()/error propagation semantics live.
+ * @param {object} req
+ * @param {object} res
+ * @param {Array<{ prefix: string, handler: Function, params?: object }>} pipeline
+ * @param {Array<{ prefix: string, handler: Function, params?: object }>} errorHandlers
+ * @param {boolean} isRouteMatched
  */
-export class MiddlewareStack {
-  constructor() {
-    this.entries = []; // Array of { prefix: string, handler: Function, isErrorHandler: boolean }
-  }
+export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatched) {
+  let index = 0;
 
-  /**
-   * Register a middleware function with an optional path prefix.
-   * @param {string|Function} prefixOrFn 
-   * @param  {...Function} fns 
-   */
-  use(prefixOrFn, ...fns) {
-    let prefix = '/';
-    let handlers = [];
-
-    if (typeof prefixOrFn === 'string') {
-      prefix = prefixOrFn.endsWith('/') && prefixOrFn.length > 1 
-        ? prefixOrFn.slice(0, -1) 
-        : prefixOrFn;
-      handlers = fns;
-    } else if (typeof prefixOrFn === 'function') {
-      handlers = [prefixOrFn, ...fns];
-    } else if (Array.isArray(prefixOrFn)) {
-      handlers = prefixOrFn.concat(fns);
+  const handleErrors = async (err) => {
+    if (errorHandlers.length === 0) {
+      defaultErrorHandler(err, req, res);
+      return;
     }
-
-    for (const fn of handlers.flat()) {
-      if (typeof fn === 'function') {
-        const isErrorHandler = fn.length === 4;
-        this.entries.push({ prefix, handler: fn, isErrorHandler });
-      }
-    }
-  }
-
-  /**
-   * Run middleware entries matching the pathname, followed by matched route handlers.
-   * @param {object} req 
-   * @param {object} res 
-   * @param {Function[]} routeHandlers 
-   * @param {boolean} isRouteMatched
-   */
-  async run(req, res, routeHandlers = [], isRouteMatched = false) {
-    const pathname = req.path;
-    
-    // Collect all matching middleware + route handlers
-    const pipeline = [];
-    const errorHandlers = [];
-
-    for (const entry of this.entries) {
-      const matchesPrefix = entry.prefix === '/' || pathname === entry.prefix || pathname.startsWith(entry.prefix + '/');
-      if (!matchesPrefix) continue;
-
-      if (entry.isErrorHandler) {
-        errorHandlers.push(entry.handler);
-      } else {
-        pipeline.push({ prefix: entry.prefix, handler: entry.handler });
-      }
-    }
-
-    // Append route-specific handlers
-    for (const handler of routeHandlers) {
-      if (handler.length === 4) {
-        errorHandlers.push(handler);
-      } else {
-        pipeline.push({ prefix: '', handler });
-      }
-    }
-
-    await this.runPipeline(req, res, pipeline, errorHandlers, isRouteMatched);
-  }
-
-  /**
-   * Execute a resolved pipeline of middlewares and route handlers in exact registration sequence.
-   * @param {object} req 
-   * @param {object} res 
-   * @param {Array<{ prefix: string, handler: Function, params?: object }>} pipeline 
-   * @param {Array<{ prefix: string, handler: Function, params?: object }>} errorHandlers 
-   * @param {boolean} isRouteMatched 
-   */
-  async runPipeline(req, res, pipeline = [], errorHandlers = [], isRouteMatched = false) {
-    const pathname = req.path;
-    let index = 0;
-
-    const next = async (err) => {
-      if (err) {
-        return handleErrors(err);
-      }
-
-      if (index >= pipeline.length) {
-        // Reached end of pipeline
-        if (!isRouteMatched && !res.writableEnded) {
-          res.status(404).json({
-            error: {
-              message: `Cannot ${req.method} ${pathname}`,
-              statusCode: 404
-            }
-          });
-        }
+    let errIdx = 0;
+    const nextErr = async (e) => {
+      const current = e || err;
+      if (errIdx >= errorHandlers.length) {
+        defaultErrorHandler(current, req, res);
         return;
       }
-
-      const item = pipeline[index++];
+      const item = errorHandlers[errIdx++];
       req.baseUrl = item.prefix === '/' ? '' : item.prefix;
       if (item.params) {
         req.params = { ...(req.params || {}), ...item.params };
       }
-      const fn = typeof item === 'function' ? item : item.handler;
-
       try {
-        const result = fn(req, res, next);
-        if (result && typeof result.then === 'function') {
-          await result;
+        const resVal = item.handler(current, req, res, nextErr);
+        if (resVal && typeof resVal.then === 'function') {
+          await resVal;
         }
-      } catch (catchedErr) {
-        await handleErrors(catchedErr);
+      } catch (unexpected) {
+        defaultErrorHandler(unexpected, req, res);
       }
     };
+    await nextErr(err);
+  };
 
-    const handleErrors = async (err) => {
-      if (errorHandlers.length > 0) {
-        let errIdx = 0;
-        const nextErr = async (e) => {
-          if (errIdx >= errorHandlers.length) {
-            defaultErrorHandler(e || err, req, res);
-            return;
+  const next = async (err) => {
+    if (err) {
+      return handleErrors(err);
+    }
+
+    if (index >= pipeline.length) {
+      if (!isRouteMatched && !res.writableEnded) {
+        res.status(404).json({
+          error: {
+            message: `Cannot ${req.method} ${req.path}`,
+            statusCode: 404
           }
-          const errItem = errorHandlers[errIdx++];
-          if (errItem.params) {
-            req.params = { ...(req.params || {}), ...errItem.params };
-          }
-          const errFn = typeof errItem === 'function' ? errItem : errItem.handler;
-          try {
-            const resVal = errFn(e || err, req, res, nextErr);
-            if (resVal && typeof resVal.then === 'function') {
-              await resVal;
-            }
-          } catch (unexpected) {
-            defaultErrorHandler(unexpected, req, res);
-          }
-        };
-        await nextErr(err);
-      } else {
-        defaultErrorHandler(err, req, res);
+        });
       }
-    };
+      return;
+    }
 
+    const item = pipeline[index++];
+    req.baseUrl = item.prefix === '/' ? '' : item.prefix;
+    if (item.params) {
+      req.params = { ...(req.params || {}), ...item.params };
+    }
+
+    try {
+      const result = item.handler(req, res, next);
+      if (result && typeof result.then === 'function') {
+        await result;
+      }
+    } catch (caughtErr) {
+      await handleErrors(caughtErr);
+    }
+  };
+
+  try {
     await next();
+  } catch (err) {
+    if (!res.writableEnded) {
+      defaultErrorHandler(err, req, res);
+    }
   }
 }
 
