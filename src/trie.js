@@ -18,6 +18,7 @@ export class TrieNode {
     this.wildcardName = null;         // Name of wildcard parameter on a wildcard node ('*' or 'filepath')
     /** @type {Array<{ handlers: Function[], paramKeys: Array<{index:number,name:string}>, wildcardIndex: number, wildcardName: string|null, routeEntry: any }>} */
     this.routes = [];                 // Route definitions terminating at this node, in insertion order
+    this.plan = null;                 // Router's cached execution plan for this node (see Router._planFor)
   }
 }
 
