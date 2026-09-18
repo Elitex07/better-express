@@ -8,7 +8,7 @@ BareWeb is designed to fulfill the core capabilities of standard web frameworks 
 
 ## ✨ Features
 
-- 🌲 **Radix Tree / Trie Router**: $O(K)$ path matching (where $K$ is path segment depth) for unambiguous routes, avoiding slow linear regex evaluation. Backtracking is bounded to protect against CPU exhaustion on ambiguous static/parameter siblings.
+- 🌲 **Radix Tree / Trie Router**: $O(K)$ path matching (where $K$ is path segment depth) for unambiguous routes, avoiding slow linear regex evaluation. When static and `:param` siblings overlap, a miss falls back to the sibling branch; since the trie is a tree each node is visited at most once, so the worst case is bounded by the size of *your* route table, never by request input, and a valid route is always found.
 - 🪶 **Zero Runtime Dependencies**: The core server framework runs natively on Node.js standard libraries (`node:http`, `node:fs`, `node:path`).
 - ⚡ **High Throughput & Low Latency**: Consistently higher throughput and lower tail latency than Express.js across typical micro-benchmarks.
 - 🔀 **Sub-Router Support**: Full modular routing with `Router`, sub-router prefix mounting (`app.use('/api', apiRouter)`), and router-scoped middleware.
