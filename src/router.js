@@ -19,7 +19,7 @@ export class Router {
    * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
    */
   constructor(options = {}) {
-    this.options = options;
+    this.config = options;
 
     /** @type {Map<string, Trie>} */
     this.trees = new Map();
@@ -113,7 +113,7 @@ export class Router {
   add(method, path, ...handlers) {
     const upperMethod = method.toUpperCase();
     if (!this.trees.has(upperMethod)) {
-      this.trees.set(upperMethod, new Trie(this.options));
+      this.trees.set(upperMethod, new Trie(this.config));
     }
 
     const flatHandlers = handlers.flat();
