@@ -13,7 +13,7 @@ export class BareWeb {
    *   Off by default: a client can set these headers freely, so only enable behind a proxy you control.
    */
   constructor(options = {}) {
-    this.options = options;
+    this.config = options;
     this.router = new Router(options);
     this._requestOptions = { trustProxy: compileTrustProxy(options.trustProxy) };
     this.server = null;

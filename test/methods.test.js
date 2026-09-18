@@ -50,3 +50,19 @@ describe('HTTP method semantics', () => {
     assert.equal(res.headers.get('allow'), null);
   });
 });
+
+describe('app.options() / router.options() registration', () => {
+  it('is callable (constructor option storage must not shadow the route method)', async () => {
+    const ctx = await startApp((app) => {
+      app.options('/thing', (req, res) => res.status(200).send('opts'));
+    }, { maxBacktracks: 10 });
+    try {
+      const res = await fetch(`${ctx.baseUrl}/thing`, { method: 'OPTIONS' });
+      assert.equal(res.status, 200);
+      assert.equal(await res.text(), 'opts');
+      assert.equal(ctx.app.config.maxBacktracks, 10);
+    } finally {
+      await ctx.close();
+    }
+  });
+});
