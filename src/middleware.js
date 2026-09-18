@@ -11,8 +11,9 @@ import { DEFAULT_BODY_LIMIT } from './request.js';
  * @param {Array<{ prefix: string, handler: Function, params?: object }>} pipeline
  * @param {Array<{ prefix: string, handler: Function, params?: object }>} errorHandlers
  * @param {boolean} isRouteMatched
+ * @param {string[]} [allowedMethods] methods that match the path when the route did not (405 / OPTIONS)
  */
-export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatched) {
+export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatched, allowedMethods = []) {
   let index = 0;
 
   const handleErrors = async (err) => {
@@ -51,12 +52,7 @@ export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatc
 
     if (index >= pipeline.length) {
       if (!isRouteMatched && !res.writableEnded) {
-        res.status(404).json({
-          error: {
-            message: `Cannot ${req.method} ${req.path}`,
-            statusCode: 404
-          }
-        });
+        sendUnmatched(req, res, allowedMethods);
       }
       return;
     }
@@ -84,6 +80,40 @@ export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatc
       defaultErrorHandler(err, req, res);
     }
   }
+}
+
+/**
+ * Terminal response when no route handled the request:
+ * - path known under other methods + OPTIONS request -> 204 with Allow (automatic preflight/discovery)
+ * - path known under other methods                    -> 405 Method Not Allowed with Allow
+ * - otherwise                                          -> 404
+ */
+export function sendUnmatched(req, res, allowedMethods = []) {
+  if (allowedMethods.length > 0) {
+    const allow = allowedMethods.join(', ');
+    res.setHeader('Allow', allow);
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 204;
+      res.setHeader('Content-Length', '0');
+      res.end();
+      return;
+    }
+    res.status(405).json({
+      error: {
+        message: `Method ${req.method} not allowed for ${req.path}`,
+        statusCode: 405,
+        allow: allowedMethods
+      }
+    });
+    return;
+  }
+
+  res.status(404).json({
+    error: {
+      message: `Cannot ${req.method} ${req.path}`,
+      statusCode: 404
+    }
+  });
 }
 
 /**
