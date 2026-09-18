@@ -197,18 +197,8 @@ export function serveStatic(rootPath, options = {}) {
       return next();
     }
 
-    const reqPath = req.path;
-    if (reqPath.includes('\0')) {
-      return res.status(400).send('Bad Request');
-    }
-
-    // Check if raw URL contains traversal attempts
-    if (req.url && req.url.includes('..')) {
-      return res.status(403).send('Forbidden');
-    }
-
     // Strip mount prefix (baseUrl)
-    let subPath = reqPath;
+    let subPath = req.path;
     if (req.baseUrl && subPath.startsWith(req.baseUrl)) {
       subPath = subPath.slice(req.baseUrl.length);
     }
@@ -216,7 +206,20 @@ export function serveStatic(rootPath, options = {}) {
       subPath = '/' + subPath;
     }
 
-    if (subPath.includes('..')) {
+    // Decode percent-encoding so "my%20file.txt" resolves; reject malformed sequences
+    try {
+      subPath = decodeURIComponent(subPath);
+    } catch {
+      return res.status(400).send('Bad Request');
+    }
+
+    if (subPath.includes('\0')) {
+      return res.status(400).send('Bad Request');
+    }
+
+    // Reject traversal on exact ".." segments only, so "a..b.txt" or "?q=.." stay valid.
+    // path.resolve + the lexical/realpath checks below are the real guard; this is a cheap early exit.
+    if (subPath.split('/').includes('..')) {
       return res.status(403).send('Forbidden');
     }
 
