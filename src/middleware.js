@@ -1,3 +1,4 @@
+import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
 import { DEFAULT_BODY_LIMIT } from './request.js';
@@ -85,21 +86,33 @@ export async function runPipeline(req, res, pipeline, errorHandlers, isRouteMatc
   }
 }
 
+/**
+ * Final error handler. In production, 5xx messages are masked with the generic
+ * HTTP status text unless the error opts in via `err.expose = true`, so internal
+ * details (DB errors, file paths, ...) never reach clients. Stack traces are
+ * only ever included outside production.
+ */
 export function defaultErrorHandler(err, req, res) {
   if (res.writableEnded) return;
 
-  const statusCode = err.statusCode || err.status || 500;
+  const isProduction = process.env.NODE_ENV === 'production';
+  const rawStatus = Number(err.statusCode || err.status);
+  const statusCode = rawStatus >= 400 && rawStatus <= 599 ? rawStatus : 500;
+  const expose = typeof err.expose === 'boolean' ? err.expose : statusCode < 500;
+
+  let message = err.message || http.STATUS_CODES[statusCode] || 'Internal Server Error';
+  if (isProduction && !expose) {
+    message = http.STATUS_CODES[statusCode] || 'Internal Server Error';
+  }
+
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  
+
   const responsePayload = {
-    error: {
-      message: err.message || 'Internal Server Error',
-      statusCode
-    }
+    error: { message, statusCode }
   };
 
-  if (process.env.NODE_ENV !== 'production' && err.stack) {
+  if (!isProduction && err.stack) {
     responsePayload.error.stack = err.stack;
   }
 
