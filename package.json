@@ -1,0 +1,35 @@
+{
+  "name": "bareweb",
+  "version": "1.0.0",
+  "description": "A high-performance, optimized, and lightweight web server framework for Node.js",
+  "main": "src/index.js",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node examples/basic-server.js",
+    "test": "node --test test/*.test.js",
+    "benchmark": "node benchmarks/compare.js"
+  },
+  "keywords": [
+    "web",
+    "server",
+    "framework",
+    "fast",
+    "lightweight",
+    "express-alternative",
+    "radix-tree"
+  ],
+  "author": "BareWeb Team",
+  "license": "MIT",
+  "devDependencies": {
+    "autocannon": "^8.0.0",
+    "express": "^4.21.2"
+  }
+}
