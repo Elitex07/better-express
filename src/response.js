@@ -156,12 +156,32 @@ export function decorateResponse(res) {
     else cookieStr += '; Path=/';
     if (options.expires) cookieStr += `; Expires=${options.expires.toUTCString()}`;
     if (options.httpOnly) cookieStr += '; HttpOnly';
-    if (options.secure) cookieStr += '; Secure';
+
+    let sameSite = null;
     if (options.sameSite) {
-      const sameSite = typeof options.sameSite === 'string' 
-        ? options.sameSite.toLowerCase() 
-        : 'strict';
-      cookieStr += `; SameSite=${sameSite.charAt(0).toUpperCase() + sameSite.slice(1)}`;
+      const raw = typeof options.sameSite === 'string' ? options.sameSite.toLowerCase() : 'strict';
+      if (raw !== 'strict' && raw !== 'lax' && raw !== 'none') {
+        throw new TypeError(`Invalid sameSite value "${options.sameSite}" (expected "strict", "lax" or "none")`);
+      }
+      sameSite = raw.charAt(0).toUpperCase() + raw.slice(1);
+    }
+    // Browsers reject SameSite=None without Secure; fail loudly instead of silently dropping the cookie
+    if (sameSite === 'None' && !options.secure) {
+      throw new TypeError('Cookies with sameSite: "none" must also set secure: true');
+    }
+    if (options.secure) cookieStr += '; Secure';
+    if (sameSite) cookieStr += `; SameSite=${sameSite}`;
+
+    if (options.priority) {
+      const p = String(options.priority).toLowerCase();
+      if (p !== 'low' && p !== 'medium' && p !== 'high') {
+        throw new TypeError(`Invalid priority value "${options.priority}" (expected "low", "medium" or "high")`);
+      }
+      cookieStr += `; Priority=${p.charAt(0).toUpperCase() + p.slice(1)}`;
+    }
+    if (options.partitioned) {
+      if (!options.secure) throw new TypeError('Partitioned cookies (CHIPS) must also set secure: true');
+      cookieStr += '; Partitioned';
     }
 
     const prev = res.getHeader('Set-Cookie');
@@ -185,14 +205,45 @@ export function decorateResponse(res) {
   };
 
   /**
-   * Redirect to URL with optional status (default 302).
-   * @param {string} url 
-   * @param {number} status 
+   * Set the Location header (chainable). "back" resolves to the Referrer or "/".
+   * @param {string} url
+   * @returns {res}
    */
-  res.redirect = function(url, status = 302) {
+  res.location = function(url) {
+    let target = url;
+    if (url === 'back') {
+      target = res.req?.headers?.referer || res.req?.headers?.referrer || '/';
+    }
+    res.setHeader('Location', target);
+    return res;
+  };
+
+  /**
+   * Redirect to URL. Accepts both `redirect(url, status)` and Express' `redirect(status, url)`.
+   * Defaults to 302 and writes a small text body so non-browser clients see where they were sent.
+   * @param {string|number} urlOrStatus
+   * @param {string|number} [statusOrUrl]
+   */
+  res.redirect = function(urlOrStatus, statusOrUrl) {
+    let url = urlOrStatus;
+    let status = 302;
+    if (typeof urlOrStatus === 'number') {
+      status = urlOrStatus;
+      url = statusOrUrl;
+    } else if (typeof statusOrUrl === 'number') {
+      status = statusOrUrl;
+    }
+    if (typeof url !== 'string') {
+      throw new TypeError('res.redirect() requires a URL string');
+    }
+
+    res.location(url);
     res.statusCode = status;
-    res.setHeader('Location', url);
-    res.end();
+    const location = res.getHeader('Location');
+    const body = `${http.STATUS_CODES[status] || 'Redirecting'}. Redirecting to ${location}`;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Length', Buffer.byteLength(body));
+    res.end(res.req?.method === 'HEAD' ? undefined : body);
     return res;
   };
 
