@@ -25,130 +25,142 @@ export const MIME_TYPES = {
   '.mp4': 'video/mp4'
 };
 
+const JSON_TYPE = 'application/json; charset=utf-8';
+const TEXT_TYPE = 'text/plain; charset=utf-8';
+const HTML_TYPE = 'text/html; charset=utf-8';
+
 /**
- * Augments Node's native http.ServerResponse with chainable helper methods
- * such as status(), json(), send(), html(), redirect(), cookie(), sendStatus(), and sendFile().
+ * Response class with Express-style chainable helpers.
+ *
+ * Passed to http.createServer as the `ServerResponse` option, so every response is
+ * created with these methods on its prototype at zero per-request cost. When
+ * BareWeb.handle is used with a foreign server, decorateResponse() swaps the
+ * prototype in instead.
  */
-export function decorateResponse(res) {
+export class BareWebResponse extends http.ServerResponse {
   /**
    * Set HTTP status code (chainable).
-   * @param {number} code 
-   * @returns {res}
+   * @param {number} code
+   * @returns {this}
    */
-  res.status = function(code) {
-    res.statusCode = code;
-    return res;
-  };
+  status(code) {
+    this.statusCode = code;
+    return this;
+  }
 
   /**
    * Set a single response header or multiple headers via an object (chainable).
-   * @param {string|Record<string, string|string[]>} nameOrHeaders 
-   * @param {string|string[]} [val] 
-   * @returns {res}
+   * @param {string|Record<string, string|string[]>} nameOrHeaders
+   * @param {string|string[]} [val]
+   * @returns {this}
    */
-  res.set = function(nameOrHeaders, val) {
+  set(nameOrHeaders, val) {
     if (typeof nameOrHeaders === 'object' && nameOrHeaders !== null) {
-      for (const [key, value] of Object.entries(nameOrHeaders)) {
-        res.setHeader(key, value);
+      for (const key in nameOrHeaders) {
+        this.setHeader(key, nameOrHeaders[key]);
       }
     } else {
-      res.setHeader(nameOrHeaders, val);
+      this.setHeader(nameOrHeaders, val);
     }
-    return res;
-  };
-  res.header = res.set;
+    return this;
+  }
+
+  header(nameOrHeaders, val) {
+    return this.set(nameOrHeaders, val);
+  }
 
   /**
    * Set Content-Type header.
-   * @param {string} type 
-   * @returns {res}
+   * @param {string} type
+   * @returns {this}
    */
-  res.type = function(type) {
-    res.setHeader('Content-Type', type);
-    return res;
-  };
+  type(type) {
+    this.setHeader('Content-Type', type);
+    return this;
+  }
 
   /**
    * Send JSON response.
-   * @param {any} data 
+   * @param {any} data
    */
-  res.json = function(data) {
-    if (!res.getHeader('Content-Type')) {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  json(data) {
+    if (!this.hasHeader('Content-Type')) {
+      this.setHeader('Content-Type', JSON_TYPE);
     }
     const payload = JSON.stringify(data);
-    res.setHeader('Content-Length', Buffer.byteLength(payload));
-    res.end(payload);
-    return res;
-  };
+    this.setHeader('Content-Length', Buffer.byteLength(payload));
+    this.end(payload);
+    return this;
+  }
 
   /**
    * Send arbitrary response (text, buffer, or json).
-   * @param {string|Buffer|object|number|boolean} body 
+   * @param {string|Buffer|object|number|boolean} body
    */
-  res.send = function(body) {
+  send(body) {
     if (body === null || body === undefined) {
-      res.end();
-      return res;
+      this.end();
+      return this;
     }
 
     if (Buffer.isBuffer(body)) {
-      if (!res.getHeader('Content-Type')) {
-        res.setHeader('Content-Type', 'application/octet-stream');
+      if (!this.hasHeader('Content-Type')) {
+        this.setHeader('Content-Type', 'application/octet-stream');
       }
-      res.setHeader('Content-Length', body.length);
-      res.end(body);
-      return res;
+      this.setHeader('Content-Length', body.length);
+      this.end(body);
+      return this;
     }
 
     if (typeof body === 'object') {
-      return res.json(body);
+      return this.json(body);
     }
 
     const str = String(body);
-    if (!res.getHeader('Content-Type')) {
-      if (str.trim().startsWith('<') && str.trim().endsWith('>')) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    if (!this.hasHeader('Content-Type')) {
+      const trimmed = str.trim();
+      if (trimmed.charCodeAt(0) === 60 /* < */ && trimmed.charCodeAt(trimmed.length - 1) === 62 /* > */) {
+        this.setHeader('Content-Type', HTML_TYPE);
       } else {
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        this.setHeader('Content-Type', TEXT_TYPE);
       }
     }
-    res.setHeader('Content-Length', Buffer.byteLength(str));
-    res.end(str);
-    return res;
-  };
+    this.setHeader('Content-Length', Buffer.byteLength(str));
+    this.end(str);
+    return this;
+  }
 
   /**
    * Send HTML response.
-   * @param {string} html 
+   * @param {string} html
    */
-  res.html = function(html) {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Content-Length', Buffer.byteLength(html));
-    res.end(html);
-    return res;
-  };
+  html(html) {
+    this.setHeader('Content-Type', HTML_TYPE);
+    this.setHeader('Content-Length', Buffer.byteLength(html));
+    this.end(html);
+    return this;
+  }
 
   /**
    * Send status code with standard HTTP status text.
-   * @param {number} statusCode 
+   * @param {number} statusCode
    */
-  res.sendStatus = function(statusCode) {
+  sendStatus(statusCode) {
     const text = http.STATUS_CODES[statusCode] || String(statusCode);
-    res.statusCode = statusCode;
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Length', Buffer.byteLength(text));
-    res.end(text);
-    return res;
-  };
+    this.statusCode = statusCode;
+    this.setHeader('Content-Type', TEXT_TYPE);
+    this.setHeader('Content-Length', Buffer.byteLength(text));
+    this.end(text);
+    return this;
+  }
 
   /**
    * Set a cookie header.
-   * @param {string} name 
-   * @param {string} val 
-   * @param {object} [options] 
+   * @param {string} name
+   * @param {string} val
+   * @param {object} [options]
    */
-  res.cookie = function(name, val, options = {}) {
+  cookie(name, val, options = {}) {
     let cookieStr = `${encodeURIComponent(name)}=${encodeURIComponent(val)}`;
     if (options.maxAge !== undefined) cookieStr += `; Max-Age=${Math.floor(options.maxAge / 1000)}`;
     if (options.domain) cookieStr += `; Domain=${options.domain}`;
@@ -184,39 +196,39 @@ export function decorateResponse(res) {
       cookieStr += '; Partitioned';
     }
 
-    const prev = res.getHeader('Set-Cookie');
+    const prev = this.getHeader('Set-Cookie');
     if (!prev) {
-      res.setHeader('Set-Cookie', cookieStr);
+      this.setHeader('Set-Cookie', cookieStr);
     } else if (Array.isArray(prev)) {
-      res.setHeader('Set-Cookie', [...prev, cookieStr]);
+      this.setHeader('Set-Cookie', [...prev, cookieStr]);
     } else {
-      res.setHeader('Set-Cookie', [prev, cookieStr]);
+      this.setHeader('Set-Cookie', [prev, cookieStr]);
     }
-    return res;
-  };
+    return this;
+  }
 
   /**
    * Clear a cookie by setting expired date.
-   * @param {string} name 
-   * @param {object} [options] 
+   * @param {string} name
+   * @param {object} [options]
    */
-  res.clearCookie = function(name, options = {}) {
-    return res.cookie(name, '', { ...options, expires: new Date(1), maxAge: 0 });
-  };
+  clearCookie(name, options = {}) {
+    return this.cookie(name, '', { ...options, expires: new Date(1), maxAge: 0 });
+  }
 
   /**
    * Set the Location header (chainable). "back" resolves to the Referrer or "/".
    * @param {string} url
-   * @returns {res}
+   * @returns {this}
    */
-  res.location = function(url) {
+  location(url) {
     let target = url;
     if (url === 'back') {
-      target = res.req?.headers?.referer || res.req?.headers?.referrer || '/';
+      target = this.req?.headers?.referer || this.req?.headers?.referrer || '/';
     }
-    res.setHeader('Location', target);
-    return res;
-  };
+    this.setHeader('Location', target);
+    return this;
+  }
 
   /**
    * Redirect to URL. Accepts both `redirect(url, status)` and Express' `redirect(status, url)`.
@@ -224,7 +236,7 @@ export function decorateResponse(res) {
    * @param {string|number} urlOrStatus
    * @param {string|number} [statusOrUrl]
    */
-  res.redirect = function(urlOrStatus, statusOrUrl) {
+  redirect(urlOrStatus, statusOrUrl) {
     let url = urlOrStatus;
     let status = 302;
     if (typeof urlOrStatus === 'number') {
@@ -237,25 +249,25 @@ export function decorateResponse(res) {
       throw new TypeError('res.redirect() requires a URL string');
     }
 
-    res.location(url);
-    res.statusCode = status;
-    const location = res.getHeader('Location');
+    this.location(url);
+    this.statusCode = status;
+    const location = this.getHeader('Location');
     const body = `${http.STATUS_CODES[status] || 'Redirecting'}. Redirecting to ${location}`;
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Length', Buffer.byteLength(body));
-    res.end(res.req?.method === 'HEAD' ? undefined : body);
-    return res;
-  };
+    this.setHeader('Content-Type', TEXT_TYPE);
+    this.setHeader('Content-Length', Buffer.byteLength(body));
+    this.end(this.req?.method === 'HEAD' ? undefined : body);
+    return this;
+  }
 
   /**
    * Stream a file to the response with proper Content-Type.
    * Resolves cleanly after handling 404/500 responses, or invokes provided callback / onError.
-   * @param {string} filePath 
-   * @param {object|Function} [optionsOrCallback] 
+   * @param {string} filePath
+   * @param {object|Function} [optionsOrCallback]
    * @param {Function} [maybeCallback]
    * @returns {Promise<void>}
    */
-  res.sendFile = function(filePath, optionsOrCallback = {}, maybeCallback) {
+  sendFile(filePath, optionsOrCallback = {}, maybeCallback) {
     let options = optionsOrCallback;
     let callback = maybeCallback;
 
@@ -264,6 +276,7 @@ export function decorateResponse(res) {
       options = {};
     }
 
+    const res = this;
     return new Promise((resolve) => {
       fs.stat(filePath, (err, stats) => {
         if (err || !stats.isFile()) {
@@ -319,7 +332,18 @@ export function decorateResponse(res) {
         });
       });
     });
-  };
+  }
+}
 
+/**
+ * Ensure `res` has the BareWeb helper methods. Responses created by BareWeb's own server
+ * already are BareWebResponse instances; for foreign servers the prototype is swapped in.
+ * @param {http.ServerResponse} res
+ * @returns {BareWebResponse}
+ */
+export function decorateResponse(res) {
+  if (!(res instanceof BareWebResponse)) {
+    Object.setPrototypeOf(res, BareWebResponse.prototype);
+  }
   return res;
 }

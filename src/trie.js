@@ -54,7 +54,8 @@ export class Trie {
     if (!p) return [];
     if (p.charCodeAt(p.length - 1) === 47 /* / */) p = p.slice(0, -1);
     if (!p) return [];
-    if (p.indexOf('//') === -1) {
+    // Fast path: no empty segments possible
+    if (p.indexOf('//') === -1 && p.charCodeAt(p.length - 1) !== 47) {
       return p.split('/');
     }
     return p.split('/').filter(Boolean);
