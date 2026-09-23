@@ -1,29 +1,32 @@
 import http from 'node:http';
 import { Router } from './router.js';
-import { runPipeline } from './middleware.js';
-import { BareWebRequest, decorateRequest, compileTrustProxy } from './request.js';
-import { BareWebResponse, decorateResponse } from './response.js';
-
-// host[:port] or [ipv6][:port]; anything else (spaces, unbalanced brackets, slashes) is a 400
-const HOST_RE = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._~%!$&'()*+,;=-]*)(?::\d*)?$/;
+import { runPipeline, defaultErrorHandler, notFound } from './middleware.js';
+import { BareRequest, decorateRequest, parseUrl, isValidHost } from './request.js';
+import { BareResponse, decorateResponse } from './response.js';
 
 export class BareWeb {
   /**
    * @param {object} [options]
-   * @param {number} [options.maxBacktracks] Deprecated, ignored (see Trie)
-   * @param {object} [options.server] Extra options forwarded to http.createServer (keepAliveTimeout, requestTimeout, ...)
-   * @param {boolean|Function|string|string[]} [options.trustProxy=false] Whether to honour
-   *   X-Forwarded-For / -Proto / -Host headers (req.ip, req.protocol, req.hostname).
-   *   Off by default: a client can set these headers freely, so only enable behind a proxy you control.
+   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   * @param {boolean} [options.trustProxy=false] Trust X-Forwarded-For / -Proto / -Host headers
+   *   for req.ip, req.protocol and req.hostname. Enable only behind a reverse proxy.
+   * @param {boolean} [options.methodNotAllowed=true] Answer 405 (with an Allow header) when the
+   *   path exists under other methods, and answer OPTIONS automatically. `false` sends 404 instead.
    */
   constructor(options = {}) {
-    this.config = options;
+    this.options = options;
     this.router = new Router(options);
-    this._requestOptions = { trustProxy: compileTrustProxy(options.trustProxy) };
     this.server = null;
+    this.middleware = {
+      use: (...args) => this.use(...args),
+      get entries() {
+        return this.router ? this.router.middlewares : [];
+      }
+    };
 
-    // Bind handler so it can be passed directly as a callback
+    // Bind handlers so they can be passed directly as callbacks
     this.handle = this.handle.bind(this);
+    this._noMatch = this._noMatch.bind(this);
   }
 
   /**
@@ -72,55 +75,62 @@ export class BareWeb {
 
   /**
    * Master request handler that processes incoming HTTP requests.
-   * Safely parses URLs, handles malformed hosts, and dispatches in registration order.
-   * @param {http.IncomingMessage} req 
-   * @param {http.ServerResponse} res 
+   * Rejects malformed hosts/targets with 400 and dispatches in registration order.
+   * Usable directly as a `node:http` request listener.
+   * @param {http.IncomingMessage} req
+   * @param {http.ServerResponse} res
+   * @returns {Promise<void>|undefined}
    */
-  async handle(req, res) {
+  handle(req, res) {
     decorateResponse(res);
 
-    const host = req.headers.host;
-    if (host !== undefined && !HOST_RE.test(host)) {
-      return sendBadUrl(res);
+    const parsed = isValidHost(req.headers.host) ? parseUrl(req.url || '/') : null;
+    if (parsed === null) {
+      decorateRequest(req, {}, { pathname: '/', search: '' });
+      defaultErrorHandler(
+        Object.assign(new Error('Bad Request: Malformed Host or URL'), { statusCode: 400, stack: undefined }),
+        req,
+        res
+      );
+      return;
     }
 
-    // Fast path: split the raw request-target ourselves instead of running the WHATWG URL
-    // parser on every request. Fall back to `new URL()` for anything unusual so semantics
-    // (dot-segment removal, absolute-form targets, fragments) stay identical to before.
-    const rawUrl = req.url || '/';
-    let pathname;
-    let search;
-    const q = rawUrl.indexOf('?');
-    if (q === -1) {
-      pathname = rawUrl;
-      search = '';
-    } else {
-      pathname = rawUrl.slice(0, q);
-      search = rawUrl.slice(q + 1);
+    try {
+      const { isRouteMatched, params, pipeline, errorHandlers } = this.router.resolve(req.method, parsed.pathname);
+      decorateRequest(req, params, parsed);
+      req.app = this;
+      return runPipeline(req, res, pipeline, errorHandlers, isRouteMatched, this._noMatch);
+    } catch (err) {
+      // e.g. a route collision introduced by a sub-router registration after startup
+      if (!req.path) decorateRequest(req, {}, parsed);
+      defaultErrorHandler(err, req, res);
     }
+  }
 
-    if (
-      pathname.charCodeAt(0) !== 47 /* / */ ||
-      pathname.indexOf('/.') !== -1 ||
-      pathname.indexOf('//') !== -1 ||
-      pathname.indexOf('\\') !== -1 ||
-      rawUrl.indexOf('#') !== -1
-    ) {
-      let parsed;
-      try {
-        parsed = new URL(rawUrl, `http://${host || 'localhost'}`);
-      } catch {
-        return sendBadUrl(res);
+  /**
+   * Called when the pipeline ends without a matching route: automatic OPTIONS,
+   * 405 Method Not Allowed when the path exists under other methods, else 404.
+   */
+  _noMatch(req, res) {
+    if (res.headersSent) return;
+    if (this.options.methodNotAllowed !== false) {
+      const allowed = this.router.allowedMethods(req.path);
+      if (allowed.length > 0) {
+        if (!allowed.includes('OPTIONS')) allowed.push('OPTIONS');
+        res.setHeader('Allow', allowed.join(', '));
+        if (req.method === 'OPTIONS') {
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+        const err = new Error(`Method ${req.method} Not Allowed on ${req.path}`);
+        err.statusCode = 405;
+        err.stack = undefined;
+        defaultErrorHandler(err, req, res);
+        return;
       }
-      pathname = parsed.pathname;
-      search = parsed.search ? parsed.search.slice(1) : '';
     }
-
-    const { isRouteMatched, params, pipeline, errorHandlers, allowedMethods } = this.router.resolve(req.method, pathname);
-
-    decorateRequest(req, params, pathname, search, this._requestOptions);
-
-    await runPipeline(req, res, pipeline, errorHandlers, isRouteMatched, allowedMethods);
+    notFound(req, res);
   }
 
   /**
@@ -131,7 +141,7 @@ export class BareWeb {
    * @returns {http.Server}
    */
   listen(port, hostOrCallback, callback) {
-    let host = '0.0.0.0';
+    let host;
     let cb = callback;
 
     if (typeof hostOrCallback === 'function') {
@@ -140,21 +150,19 @@ export class BareWeb {
       host = hostOrCallback;
     }
 
-    this.server = this.createServer();
-    return this.server.listen(port, host, cb);
-  }
+    // Flatten routes now so registration errors (e.g. route collisions) surface at startup
+    this.router._ensureCompiled();
 
-  /**
-   * Create (but do not start) an http.Server wired to this app. Requests and responses are
-   * instantiated directly as BareWebRequest / BareWebResponse so no per-request decoration is needed.
-   * Extra node:http server options can be passed via createApp({ server: { keepAliveTimeout, ... } }).
-   * @returns {http.Server}
-   */
-  createServer() {
-    return http.createServer(
-      { ...(this.config.server || {}), IncomingMessage: BareWebRequest, ServerResponse: BareWebResponse },
+    // Build req/res from BareWeb's classes directly, so helpers come from the
+    // prototype chain instead of being attached per request.
+    this.server = http.createServer(
+      { IncomingMessage: BareRequest, ServerResponse: BareResponse },
       this.handle
     );
+    // Without a host, Node listens on :: (IPv4 + IPv6) when available
+    return host === undefined
+      ? this.server.listen(port, cb)
+      : this.server.listen(port, host, cb);
   }
 
   /**
@@ -167,17 +175,6 @@ export class BareWeb {
     } else if (cb) {
       cb();
     }
-  }
-}
-
-function sendBadUrl(res) {
-  if (!res.writableEnded) {
-    res.status(400).json({
-      error: {
-        message: 'Bad Request: Malformed Host or URL',
-        statusCode: 400
-      }
-    });
   }
 }
 

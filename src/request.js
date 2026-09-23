@@ -1,15 +1,17 @@
 import http from 'node:http';
 
 /**
- * Request class with Express-style helper properties and async body parsers.
+ * Request helpers for BareWeb.
  *
- * Passed to http.createServer as the `IncomingMessage` option, so every request is
- * created with these helpers on its prototype at zero per-request cost. Expensive
- * derived values (query object, URLSearchParams, cookies, hostname) are computed
- * lazily on first access and cached on the instance.
+ * All helpers live on BareRequest.prototype instead of being attached as fresh
+ * closures on every request: V8 keeps a single stable hidden class for requests,
+ * and derived values (query, cookies, ip, ...) are computed lazily on first access.
  */
 
 export const DEFAULT_BODY_LIMIT = 1024 * 1024; // 1 MB
+
+// Host header per RFC 3986: non-empty reg-name / IPv4 or bracketed IP literal, optional port.
+const HOST_RE = /^(?:[A-Za-z0-9\-._~!$&'()*+,;=%]+|\[[0-9A-Fa-f:.]+\])(?::(\d{0,5}))?$/;
 
 /**
  * Fast query string parser supporting arrays and duplicate keys.
@@ -21,8 +23,11 @@ export function parseQuery(searchParams) {
   for (const [key, value] of searchParams) {
     const isArrayKey = key.endsWith('[]');
     const cleanKey = isArrayKey ? key.slice(0, -2) : key;
+    // Never let a query key reach Object.prototype
+    if (cleanKey === '__proto__') continue;
 
-    const existing = query[cleanKey];
+    // Own-property check: keys like "constructor" must not see Object.prototype
+    const existing = Object.hasOwn(query, cleanKey) ? query[cleanKey] : undefined;
     if (existing !== undefined) {
       if (Array.isArray(existing)) {
         existing.push(value);
@@ -39,51 +44,41 @@ export function parseQuery(searchParams) {
 }
 
 /**
- * Normalise the `trustProxy` option into a predicate over the socket's remote address.
- * - false/undefined: never trust X-Forwarded-* (default; safe for direct exposure)
- * - true: always trust
- * - function(remoteAddress): custom decision
- * - string | string[]: trust when remoteAddress is in the list ('loopback' is a shortcut)
- * @param {boolean|Function|string|string[]} [trustProxy]
- * @returns {(remoteAddress: string) => boolean}
+ * Split a raw request target into pathname and search string without building a
+ * WHATWG URL on the hot path. Falls back to URL for targets that need
+ * normalization (dot segments, backslashes, absolute-form).
+ * @param {string} rawUrl
+ * @returns {{ pathname: string, search: string } | null} null when the target is malformed
  */
-export function compileTrustProxy(trustProxy) {
-  if (trustProxy === true) return () => true;
-  if (typeof trustProxy === 'function') return trustProxy;
-  if (typeof trustProxy === 'string' || Array.isArray(trustProxy)) {
-    const list = new Set(
-      (Array.isArray(trustProxy) ? trustProxy : trustProxy.split(','))
-        .map((s) => s.trim())
-        .filter(Boolean)
-    );
-    if (list.has('loopback')) {
-      list.add('127.0.0.1');
-      list.add('::1');
-      list.add('::ffff:127.0.0.1');
-    }
-    return (addr) => list.has(addr);
+export function parseUrl(rawUrl) {
+  const qIdx = rawUrl.indexOf('?');
+  const rawPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+
+  if (
+    rawPath.charCodeAt(0) === 47 /* / */ &&
+    rawPath.indexOf('/.') === -1 &&
+    rawPath.indexOf('\\') === -1
+  ) {
+    return { pathname: rawPath, search: qIdx === -1 ? '' : rawUrl.slice(qIdx) };
   }
-  return () => false;
+
+  try {
+    const url = new URL(rawUrl, 'http://localhost');
+    return { pathname: url.pathname, search: url.search };
+  } catch {
+    return null;
+  }
 }
 
-const NEVER_TRUST = () => false;
-const EMPTY_OBJECT = Object.freeze({});
-
-function firstForwarded(value) {
-  if (!value) return undefined;
-  const comma = value.indexOf(',');
-  return (comma === -1 ? value : value.slice(0, comma)).trim() || undefined;
-}
-
-/** Strip the port from a Host header value, handling bracketed IPv6. */
-function hostWithoutPort(host) {
-  if (!host) return '';
-  if (host.charCodeAt(0) === 91 /* [ */) {
-    const close = host.indexOf(']');
-    return close === -1 ? host : host.slice(0, close + 1);
-  }
-  const colon = host.indexOf(':');
-  return colon === -1 ? host : host.slice(0, colon);
+/**
+ * @param {string|undefined} host
+ * @returns {boolean}
+ */
+export function isValidHost(host) {
+  // A missing/empty Host (HTTP/1.0 clients) is tolerated, as before
+  if (host === undefined || host === '') return true;
+  const match = HOST_RE.exec(host);
+  return match !== null && (!match[1] || Number(match[1]) <= 65535);
 }
 
 function payloadTooLarge(limit) {
@@ -93,49 +88,24 @@ function payloadTooLarge(limit) {
   return err;
 }
 
-export class BareWebRequest extends http.IncomingMessage {
-  // --- header helpers -----------------------------------------------------
-
+export class BareRequest extends http.IncomingMessage {
   /**
-   * Header getter helper (Express-compatible). "referrer" and "referer" are interchangeable.
+   * Header getter helper (Express-compatible).
    * @param {string} headerName
    */
   get(headerName) {
     const name = headerName.toLowerCase();
-    if (name === 'referrer' || name === 'referer') {
-      return this.headers.referer || this.headers.referrer;
+    if (name === 'referer' || name === 'referrer') {
+      return this.headers.referrer || this.headers.referer;
     }
     return this.headers[name];
   }
 
-  /** True when the request was made with XMLHttpRequest (X-Requested-With). */
-  get xhr() {
-    return (this.headers['x-requested-with'] || '').toLowerCase() === 'xmlhttprequest';
-  }
-
-  // --- URL-derived, lazy --------------------------------------------------
-
-  /** Raw query string without the leading "?" ("" when absent). */
-  get search() {
-    return this._search === undefined ? '' : this._search;
-  }
-
-  /** @returns {URLSearchParams} */
-  get searchParams() {
-    if (this._searchParams === undefined || this._searchParams === null) {
-      this._searchParams = new URLSearchParams(this.search);
-    }
-    return this._searchParams;
-  }
-
-  set searchParams(value) {
-    this._searchParams = value;
-  }
-
-  /** Parsed query object (arrays for repeated keys / "key[]"). */
   get query() {
-    if (this._query === undefined || this._query === null) {
-      this._query = this._search ? parseQuery(this.searchParams) : {};
+    if (this._query === undefined) {
+      this._query = this._search && this._search.length > 1
+        ? parseQuery(new URLSearchParams(this._search))
+        : {};
     }
     return this._query;
   }
@@ -144,156 +114,173 @@ export class BareWebRequest extends http.IncomingMessage {
     this._query = value;
   }
 
-  get hostname() {
-    if (this._hostname === undefined || this._hostname === null) {
-      const forwarded = this._trusted ? firstForwarded(this.headers['x-forwarded-host']) : undefined;
-      this._hostname = hostWithoutPort(forwarded || this.headers.host || '');
+  get searchParams() {
+    if (this._searchParams === undefined) {
+      this._searchParams = new URLSearchParams(this._search || '');
     }
-    return this._hostname;
+    return this._searchParams;
   }
 
-  set hostname(value) {
-    this._hostname = value;
+  set searchParams(value) {
+    this._searchParams = value;
+  }
+
+  /** Whether X-Forwarded-* headers may be trusted (see the `trustProxy` app option). */
+  get _trustProxy() {
+    return Boolean(this.app && this.app.options && this.app.options.trustProxy);
+  }
+
+  get ip() {
+    if (this._trustProxy) {
+      const xff = this.headers['x-forwarded-for'];
+      if (xff) {
+        const comma = xff.indexOf(',');
+        return (comma === -1 ? xff : xff.slice(0, comma)).trim();
+      }
+    }
+    return this.socket?.remoteAddress || '';
   }
 
   get protocol() {
-    if (this._protocol === undefined || this._protocol === null) {
-      const forwarded = this._trusted ? firstForwarded(this.headers['x-forwarded-proto']) : undefined;
-      this._protocol = forwarded || (this.socket && this.socket.encrypted ? 'https' : 'http');
+    if (this._trustProxy) {
+      const proto = this.headers['x-forwarded-proto'];
+      if (proto) {
+        const comma = proto.indexOf(',');
+        return (comma === -1 ? proto : proto.slice(0, comma)).trim().toLowerCase();
+      }
     }
-    return this._protocol;
-  }
-
-  set protocol(value) {
-    this._protocol = value;
+    return this.socket?.encrypted ? 'https' : 'http';
   }
 
   get secure() {
     return this.protocol === 'https';
   }
 
-  get ip() {
-    if (this._ip === undefined || this._ip === null) {
-      const remote = (this.socket && this.socket.remoteAddress) || '';
-      const forwarded = this._trusted ? firstForwarded(this.headers['x-forwarded-for']) : undefined;
-      this._ip = forwarded || remote;
-    }
-    return this._ip;
+  get hostname() {
+    let host = (this._trustProxy && this.headers['x-forwarded-host']) || this.headers.host;
+    if (!host) return '';
+    const comma = host.indexOf(',');
+    if (comma !== -1) host = host.slice(0, comma).trim();
+    // IPv6 literal: keep the brackets, strip the port after them
+    const offset = host.charCodeAt(0) === 91 /* [ */ ? host.indexOf(']') + 1 : 0;
+    const colon = host.indexOf(':', offset);
+    return (colon === -1 ? host : host.slice(0, colon)).toLowerCase();
   }
 
-  set ip(value) {
-    this._ip = value;
+  get xhr() {
+    return (this.headers['x-requested-with'] || '').toLowerCase() === 'xmlhttprequest';
   }
 
-  // --- cookies ------------------------------------------------------------
-
+  /** Lazily parsed cookies. */
   get cookies() {
-    if (this._cookies === undefined || this._cookies === null) {
-      const cookies = {};
-      const cookieHeader = this.headers.cookie;
-      if (cookieHeader) {
-        const pairs = cookieHeader.split(';');
-        for (let i = 0; i < pairs.length; i++) {
-          const pair = pairs[i];
-          const eqIdx = pair.indexOf('=');
-          if (eqIdx > 0) {
-            const key = pair.slice(0, eqIdx).trim();
-            const val = pair.slice(eqIdx + 1).trim();
-            try {
-              cookies[decodeURIComponent(key)] = decodeURIComponent(val);
-            } catch {
-              cookies[key] = val;
-            }
-          }
+    if (this._parsedCookies) return this._parsedCookies;
+    const cookies = {};
+    const cookieHeader = this.headers.cookie;
+    if (cookieHeader) {
+      const pairs = cookieHeader.split(';');
+      for (let i = 0; i < pairs.length; i++) {
+        const pair = pairs[i];
+        const eqIdx = pair.indexOf('=');
+        if (eqIdx <= 0) continue;
+        let key = pair.slice(0, eqIdx).trim();
+        if (key.indexOf('%') !== -1) {
+          try { key = decodeURIComponent(key); } catch { /* keep raw key */ }
+        }
+        let val = pair.slice(eqIdx + 1).trim();
+        if (val.charCodeAt(0) === 34 /* " */ && val.charCodeAt(val.length - 1) === 34) {
+          val = val.slice(1, -1);
+        }
+        // First occurrence wins (RFC 6265 ordering: most specific path first)
+        if (key === '__proto__' || Object.hasOwn(cookies, key)) continue;
+        try {
+          cookies[key] = val.indexOf('%') === -1 ? val : decodeURIComponent(val);
+        } catch {
+          cookies[key] = val;
         }
       }
-      this._cookies = cookies;
     }
-    return this._cookies;
+    this._parsedCookies = cookies;
+    return cookies;
   }
 
   set cookies(value) {
-    this._cookies = value;
+    this._parsedCookies = value;
   }
-
-  // --- body ---------------------------------------------------------------
 
   /**
    * Read raw request body as Buffer with a size limit.
-   * Rejects with HTTP 413 Payload Too Large on overflow, even for cached reads.
-   * @param {number} limit Maximum allowed bytes
+   * Rejects with HTTP 413 on overflow, even for cached reads.
+   * @param {number} [limit]
    * @returns {Promise<Buffer>}
    */
   buffer(limit = DEFAULT_BODY_LIMIT) {
-    let state = this._bodyState;
-    if (state === undefined || state === null) {
-      state = this._bodyState = { promise: null, buffer: null, limit: Infinity };
+    if (this._bodyBuffer) {
+      return this._bodyBuffer.length > limit
+        ? Promise.reject(payloadTooLarge(limit))
+        : Promise.resolve(this._bodyBuffer);
     }
 
-    if (state.buffer !== null) {
-      if (state.buffer.length > limit) {
-        return Promise.reject(payloadTooLarge(limit));
-      }
-      return Promise.resolve(state.buffer);
-    }
-
-    if (state.promise !== null) {
-      if (limit < state.limit) {
-        state.limit = limit;
-      }
-      return state.promise.then((buf) => {
+    if (this._bodyPromise) {
+      if (limit < this._bodyLimit) this._bodyLimit = limit;
+      return this._bodyPromise.then((buf) => {
         if (buf.length > limit) throw payloadTooLarge(limit);
         return buf;
       });
     }
 
-    state.limit = limit;
-    const req = this;
+    this._bodyLimit = limit;
 
-    state.promise = new Promise((resolve, reject) => {
+    // Reject early when the declared length already exceeds the limit.
+    const declared = this.headers['content-length'];
+    if (declared !== undefined && Number(declared) > limit) {
+      this.resume();
+      this._bodyPromise = Promise.reject(payloadTooLarge(limit));
+      return this._bodyPromise;
+    }
+
+    this._bodyPromise = new Promise((resolve, reject) => {
       const chunks = [];
       let totalSize = 0;
-      let exceeded = false;
+
+      const cleanup = () => {
+        this.removeListener('data', onData);
+        this.removeListener('end', onEnd);
+        this.removeListener('error', onError);
+      };
 
       const onData = (chunk) => {
-        if (exceeded) return;
         totalSize += chunk.length;
-        if (totalSize > state.limit) {
-          exceeded = true;
-          req.removeListener('data', onData);
-          req.removeListener('end', onEnd);
-          req.removeListener('error', onError);
-          req.resume(); // drain remaining stream so socket does not block
-          reject(payloadTooLarge(state.limit));
+        if (totalSize > this._bodyLimit) {
+          cleanup();
+          this.resume(); // drain remaining stream so the socket does not stall
+          reject(payloadTooLarge(this._bodyLimit));
           return;
         }
         chunks.push(chunk);
       };
 
       const onEnd = () => {
-        if (!exceeded) {
-          state.buffer = Buffer.concat(chunks);
-          resolve(state.buffer);
-        }
+        cleanup();
+        this._bodyBuffer = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, totalSize);
+        resolve(this._bodyBuffer);
       };
 
       const onError = (err) => {
-        if (!exceeded) {
-          reject(err);
-        }
+        cleanup();
+        reject(err);
       };
 
-      req.on('data', onData);
-      req.on('end', onEnd);
-      req.on('error', onError);
+      this.on('data', onData);
+      this.on('end', onEnd);
+      this.on('error', onError);
     });
 
-    return state.promise;
+    return this._bodyPromise;
   }
 
   /**
    * Read request body as a UTF-8 string.
-   * @param {number} limit
+   * @param {number} [limit]
    * @returns {Promise<string>}
    */
   async text(limit = DEFAULT_BODY_LIMIT) {
@@ -303,8 +290,7 @@ export class BareWebRequest extends http.IncomingMessage {
 
   /**
    * Parse incoming JSON request body.
-   * Enforces requested limit even when body was previously cached.
-   * @param {number} limit
+   * @param {number} [limit]
    * @returns {Promise<any>}
    */
   async json(limit = DEFAULT_BODY_LIMIT) {
@@ -315,24 +301,22 @@ export class BareWebRequest extends http.IncomingMessage {
     const raw = buf.toString('utf-8');
     if (!raw || raw.trim() === '') {
       this.body = {};
-      this._bodyFormat = 'json';
-      return this.body;
+    } else {
+      try {
+        this.body = JSON.parse(raw);
+      } catch {
+        const parseError = new Error('Invalid JSON payload');
+        parseError.statusCode = 400;
+        throw parseError;
+      }
     }
-    try {
-      this.body = JSON.parse(raw);
-      this._bodyFormat = 'json';
-      return this.body;
-    } catch {
-      const parseError = new Error('Invalid JSON payload');
-      parseError.statusCode = 400;
-      throw parseError;
-    }
+    this._bodyFormat = 'json';
+    return this.body;
   }
 
   /**
    * Parse incoming URL-encoded form body.
-   * Enforces requested limit even when body was previously cached.
-   * @param {number} limit
+   * @param {number} [limit]
    * @returns {Promise<Record<string, string|string[]>>}
    */
   async urlencoded(limit = DEFAULT_BODY_LIMIT) {
@@ -341,58 +325,38 @@ export class BareWebRequest extends http.IncomingMessage {
       return this.body;
     }
     const raw = buf.toString('utf-8');
-    if (!raw || raw.trim() === '') {
-      this.body = {};
-      this._bodyFormat = 'urlencoded';
-      return this.body;
-    }
-    this.body = parseQuery(new URLSearchParams(raw));
+    this.body = !raw || raw.trim() === '' ? {} : parseQuery(new URLSearchParams(raw));
     this._bodyFormat = 'urlencoded';
     return this.body;
   }
 }
 
+// Derived getters stay assignable: writing one shadows it with an own property,
+// so middleware can override e.g. `req.ip` without a TypeError in strict mode.
+for (const name of ['ip', 'protocol', 'secure', 'hostname', 'xhr']) {
+  const descriptor = Object.getOwnPropertyDescriptor(BareRequest.prototype, name);
+  descriptor.set = function (value) {
+    Object.defineProperty(this, name, { value, writable: true, configurable: true, enumerable: true });
+  };
+  Object.defineProperty(BareRequest.prototype, name, descriptor);
+}
+
 /**
- * Initialise per-request state on `req` and make sure it has the BareWebRequest helpers.
- * Requests created by BareWeb's own server already are BareWebRequest instances; for
- * foreign servers the prototype is swapped in.
- *
+ * Prepare a request for the BareWeb pipeline. Requests created by a BareWeb server
+ * already are BareRequests; foreign ones (e.g. `http.createServer(app.handle)`)
+ * get their prototype swapped once, like Express does.
  * @param {http.IncomingMessage} req
- * @param {Record<string, string>} params route params
- * @param {string|URL} pathnameOrUrl request pathname (or a parsed URL, legacy form)
- * @param {string|object} [searchOrOptions] raw query string without "?" (or options, legacy form)
- * @param {object} [options]
- * @param {(remoteAddress: string) => boolean} [options.trustProxy] compiled predicate (see compileTrustProxy)
- * @returns {BareWebRequest}
+ * @param {Record<string, string>} [params]
+ * @param {{ pathname: string, search?: string }} [parsedUrl] URL or parseUrl() result
  */
-export function decorateRequest(req, params = EMPTY_OBJECT, pathnameOrUrl = '/', searchOrOptions = '', options = EMPTY_OBJECT) {
-  if (!(req instanceof BareWebRequest)) {
-    Object.setPrototypeOf(req, BareWebRequest.prototype);
+export function decorateRequest(req, params = {}, parsedUrl) {
+  if (!(req instanceof BareRequest)) {
+    Object.setPrototypeOf(req, BareRequest.prototype);
   }
-
-  let pathname = pathnameOrUrl;
-  let search = searchOrOptions;
-  if (typeof pathnameOrUrl === 'object' && pathnameOrUrl !== null) {
-    // Legacy signature: decorateRequest(req, params, parsedUrl, options)
-    pathname = pathnameOrUrl.pathname;
-    search = pathnameOrUrl.search ? pathnameOrUrl.search.slice(1) : '';
-    options = searchOrOptions || EMPTY_OBJECT;
-  }
-
+  const parsed = parsedUrl || parseUrl(req.url || '/') || { pathname: '/', search: '' };
   req.params = params;
-  req.path = pathname;
+  req.path = parsed.pathname;
+  req._search = parsed.search || '';
   req.baseUrl = '';
-  req._search = search;
-  req._query = null;
-  req._searchParams = null;
-  req._hostname = null;
-  req._protocol = null;
-  req._ip = null;
-  req._cookies = null;
-  req._bodyState = null;
-
-  const trust = options.trustProxy || NEVER_TRUST;
-  req._trusted = trust((req.socket && req.socket.remoteAddress) || '');
-
   return req;
 }

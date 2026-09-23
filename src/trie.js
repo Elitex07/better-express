@@ -1,45 +1,43 @@
 /**
- * Radix Tree / Trie implementation for high-performance HTTP route matching.
+ * Segment trie for HTTP route matching.
  *
- * Lookup is O(K) in the number of path segments for unambiguous route tables.
- * When a node has both a static child and a `:param` child, a failed deep match
- * falls back to the sibling branch. Because the structure is a tree, every node
- * is visited at most once per search, so the worst case is O(N) in the number of
- * trie nodes compatible with the request path - bounded by the route table the
- * developer registered, never by request input. A valid route is always found.
+ * - Fully static routes are also indexed in a Map, so the common case is a single
+ *   hash lookup with no path splitting at all.
+ * - Dynamic lookups walk the trie in O(K) (K = path segments) for unambiguous
+ *   tables. Static > :param > *wildcard priority; backtracking between ambiguous
+ *   static/param siblings is bounded by `maxBacktracks`.
  */
 
 export class TrieNode {
   constructor(segment = '') {
     this.segment = segment;
     this.staticChildren = new Map(); // literal segment -> TrieNode
-    this.paramChild = null;           // TrieNode for :param
-    this.wildcardChild = null;        // TrieNode for '*'
-    this.wildcardName = null;         // Name of wildcard parameter on a wildcard node ('*' or 'filepath')
-    /** @type {Array<{ handlers: Function[], paramKeys: Array<{index:number,name:string}>, wildcardIndex: number, wildcardName: string|null, routeEntry: any }>} */
-    this.routes = [];                 // Route definitions terminating at this node, in insertion order
-    this.plan = null;                 // Router's cached execution plan for this node (see Router._planFor)
+    this.paramChild = null;          // TrieNode for :param
+    this.wildcardChild = null;       // TrieNode for '*'
+    this.wildcardName = null;        // Name of wildcard parameter (e.g., '*' or 'filepath')
+    this.routes = [];                // Route definitions ending at this node
   }
 }
 
-function safeDecode(raw) {
-  // Fast path: nothing to decode
-  if (raw.indexOf('%') === -1) return raw;
+function decode(value) {
+  if (value.indexOf('%') === -1) return value;
   try {
-    return decodeURIComponent(raw);
+    return decodeURIComponent(value);
   } catch {
-    return raw;
+    return value;
   }
 }
 
 export class Trie {
   /**
    * @param {object} [options]
-   * @param {number} [options.maxBacktracks] Deprecated and ignored. The former cap could reject a valid
-   *   deep route with a false 404; search cost is bounded by route-table size (see file header).
+   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps before aborting ambiguous branch exploration
    */
   constructor(options = {}) {
     this.root = new TrieNode();
+    this.maxBacktracks = options.maxBacktracks ?? 500;
+    /** @type {Map<string, TrieNode>} normalized static path -> node */
+    this.staticRoutes = new Map();
   }
 
   /**
@@ -55,8 +53,7 @@ export class Trie {
     if (!p) return [];
     if (p.charCodeAt(p.length - 1) === 47 /* / */) p = p.slice(0, -1);
     if (!p) return [];
-    // Fast path: no empty segments possible
-    if (p.indexOf('//') === -1 && p.charCodeAt(p.length - 1) !== 47) {
+    if (!p.includes('//')) {
       return p.split('/');
     }
     return p.split('/').filter(Boolean);
@@ -66,7 +63,7 @@ export class Trie {
    * Insert a route path and its associated handlers into the Trie.
    * @param {string} path
    * @param {Function[]} handlers
-   * @param {object} [routeEntry] Optional parent route entry reference (Router bookkeeping)
+   * @param {object} [routeEntry] Optional router entry this route belongs to
    */
   insert(path, handlers, routeEntry = null) {
     if (!handlers || !Array.isArray(handlers) || handlers.length === 0) {
@@ -91,7 +88,7 @@ export class Trie {
         wildcardIndex = i;
         wildcardName = segment === '*' ? '*' : segment.slice(1);
         if (current.wildcardChild) {
-          if (current.wildcardChild.wildcardName && current.wildcardChild.wildcardName !== wildcardName) {
+          if (current.wildcardChild.wildcardName !== wildcardName) {
             throw new Error(`Route collision: wildcard "*${wildcardName}" conflicts with existing wildcard "*${current.wildcardChild.wildcardName}" on path "${path}"`);
           }
         } else {
@@ -111,80 +108,74 @@ export class Trie {
     }
 
     current.routes.push({ handlers, paramKeys, wildcardIndex, wildcardName, routeEntry });
-  }
 
-  /**
-   * Low-level lookup used by the Router: returns the terminal node and the split segments,
-   * or null when nothing matches. Allocates nothing beyond the segment array.
-   * @param {string} pathname
-   * @returns {{ node: TrieNode, segments: string[] } | null}
-   */
-  lookup(pathname) {
-    const segments = Trie.splitPath(pathname);
-    const node = this._searchNode(this.root, segments, 0);
-    return node ? { node, segments } : null;
-  }
-
-  /**
-   * Extract params for one route definition from the matched segments into `into`.
-   * @param {object} route route definition stored on a TrieNode
-   * @param {string[]} segments
-   * @param {Record<string, string>} into
-   */
-  static extractParams(route, segments, into) {
-    const keys = route.paramKeys;
-    for (let i = 0; i < keys.length; i++) {
-      into[keys[i].name] = safeDecode(segments[keys[i].index]);
+    if (paramKeys.length === 0 && wildcardIndex === -1) {
+      this.staticRoutes.set('/' + segments.join('/'), current);
     }
-    if (route.wildcardIndex !== -1) {
-      const val = safeDecode(segments.slice(route.wildcardIndex).join('/'));
-      into['*'] = val;
-      if (route.wildcardName && route.wildcardName !== '*') {
-        into[route.wildcardName] = val;
-      }
-    }
-    return into;
   }
 
   /**
    * Search for a route matching the given pathname.
-   * Returns { handlers, params, matches } or null if no route matches.
-   * `matches` carries one entry per route definition terminating at the node, with that
-   * route's own params (routes that share a node may declare different param names).
+   * `params` merges the parameters of every route ending at the matched node;
+   * `matches` carries each route's own parameters (never shared across requests).
    * @param {string} pathname
-   * @returns {{ handlers: Function[], params: Record<string, string>, matches: Array<{ routeEntry: any, handlers: Function[], params: Record<string, string> }> } | null}
+   * @returns {{
+   *   handlers: Function[],
+   *   params: Record<string, string>,
+   *   handlersWithParams: Array<{ handler: Function, params: Record<string, string>, routeEntry: any }>,
+   *   matches: Array<{ routeEntry: any, params: Record<string, string>, handlers: Function[] }>,
+   *   routeEntries: any[],
+   *   routes: any[]
+   * } | null}
    */
   search(pathname) {
-    const found = this.lookup(pathname);
-    if (!found) return null;
+    let node = this.staticRoutes.get(pathname);
+    let segments = null;
 
-    const { node, segments } = found;
-    const params = {};
-    const handlers = [];
-    const matches = [];
-
-    for (const route of node.routes) {
-      const routeParams = Trie.extractParams(route, segments, {});
-      Object.assign(params, routeParams);
-      for (const h of route.handlers) handlers.push(h);
-      matches.push({ routeEntry: route.routeEntry, handlers: route.handlers, params: routeParams });
+    if (node === undefined) {
+      segments = Trie.splitPath(pathname);
+      node = this._searchNode(this.root, segments, 0, { backtracks: 0 });
+      if (!node) return null;
     }
 
-    return { handlers, params, matches };
+    const params = {};
+    const handlers = [];
+    const handlersWithParams = [];
+    const matches = [];
+    const routeEntries = [];
+
+    for (const route of node.routes) {
+      let routeParams = params;
+      if (segments !== null && (route.paramKeys.length > 0 || route.wildcardIndex !== -1)) {
+        routeParams = {};
+        for (const { index, name } of route.paramKeys) {
+          routeParams[name] = params[name] = decode(segments[index]);
+        }
+        if (route.wildcardIndex !== -1) {
+          const val = decode(segments.slice(route.wildcardIndex).join('/'));
+          routeParams['*'] = params['*'] = val;
+          if (route.wildcardName !== '*') {
+            routeParams[route.wildcardName] = params[route.wildcardName] = val;
+          }
+        }
+      }
+
+      matches.push({ routeEntry: route.routeEntry, params: routeParams, handlers: route.handlers });
+      if (route.routeEntry) routeEntries.push(route.routeEntry);
+      for (const h of route.handlers) {
+        handlers.push(h);
+        handlersWithParams.push({ handler: h, params: routeParams, routeEntry: route.routeEntry });
+      }
+    }
+
+    return { handlers, handlersWithParams, params, matches, routeEntries, routes: node.routes };
   }
 
-  /**
-   * Depth-first match: static child, then :param child, then wildcard.
-   * @param {TrieNode} node
-   * @param {string[]} segments
-   * @param {number} index
-   * @returns {TrieNode|null}
-   */
-  _searchNode(node, segments, index) {
+  _searchNode(node, segments, index, state) {
     // Reached the end of segments
     if (index === segments.length) {
       if (node.routes.length > 0) return node;
-      // A wildcard may match the empty remainder ("/static/*" matches "/static")
+      // A wildcard also matches the empty remainder
       if (node.wildcardChild && node.wildcardChild.routes.length > 0) {
         return node.wildcardChild;
       }
@@ -192,28 +183,29 @@ export class Trie {
     }
 
     const segment = segments[index];
-    const staticChild = node.staticChildren.get(segment);
 
     // 1. Exact static match first
-    if (staticChild) {
-      const match = this._searchNode(staticChild, segments, index + 1);
+    const staticChild = node.staticChildren.get(segment);
+    if (staticChild !== undefined) {
+      const match = this._searchNode(staticChild, segments, index + 1, state);
       if (match) return match;
     }
 
-    // 2. Parameterised match (:param) - reached only if the static branch failed (backtrack)
+    // 2. Parameterized match (:param)
     if (node.paramChild) {
-      const match = this._searchNode(node.paramChild, segments, index + 1);
+      // Falling back from a failed static branch counts as a backtrack
+      if (staticChild !== undefined && ++state.backtracks > this.maxBacktracks) {
+        return null;
+      }
+      const match = this._searchNode(node.paramChild, segments, index + 1, state);
       if (match) return match;
     }
 
     // 3. Wildcard match (*)
-    return this._wildcardOrNull(node);
-  }
-
-  _wildcardOrNull(node) {
     if (node.wildcardChild && node.wildcardChild.routes.length > 0) {
       return node.wildcardChild;
     }
+
     return null;
   }
 }
