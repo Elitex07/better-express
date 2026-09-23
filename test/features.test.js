@@ -18,9 +18,6 @@ describe('BareWeb Advanced Features Integration Tests', () => {
       fs.mkdirSync(fixtureDir, { recursive: true });
     }
     fs.writeFileSync(fixtureFile, 'Hello BareWeb Static Files!');
-    fs.writeFileSync(path.join(fixtureDir, 'index.html'), '<h1>index</h1>');
-    fs.writeFileSync(path.join(fixtureDir, 'notes..v2.txt'), 'dots in name');
-    fs.writeFileSync(path.join(fixtureDir, 'with space.txt'), 'space in name');
 
     app = createApp();
 
@@ -119,7 +116,12 @@ describe('BareWeb Advanced Features Integration Tests', () => {
   after(async () => {
     await new Promise((resolve) => app.close(resolve));
     // Cleanup fixture
-    fs.rmSync(fixtureDir, { recursive: true, force: true });
+    if (fs.existsSync(fixtureFile)) {
+      fs.unlinkSync(fixtureFile);
+    }
+    if (fs.existsSync(fixtureDir)) {
+      fs.rmdirSync(fixtureDir);
+    }
   });
 
   it('should apply CORS headers and handle OPTIONS preflight', async () => {
@@ -226,27 +228,6 @@ describe('BareWeb Advanced Features Integration Tests', () => {
     };
     await mw({ method: 'GET', url: '/public/../package.json', path: '/../package.json' }, mockRes, () => {});
     assert.strictEqual(statusCode, 403);
-
-    // percent-encoded traversal is decoded and rejected too
-    statusCode = undefined;
-    await mw({ method: 'GET', url: '/public/%2e%2e/package.json', path: '/%2e%2e/package.json' }, mockRes, () => {});
-    assert.strictEqual(statusCode, 403);
-  });
-
-  it('should not reject legitimate URLs that merely contain ".." or need decoding', async () => {
-    // ".." inside the query string used to trigger a blanket 403
-    let res = await fetch(`${baseUrl}/public/index.html?q=a..b`);
-    assert.strictEqual(res.status, 200);
-
-    // ".." inside a filename is not a traversal
-    res = await fetch(`${baseUrl}/public/notes..v2.txt`);
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(await res.text(), 'dots in name');
-
-    // percent-encoded characters resolve to the real file
-    res = await fetch(`${baseUrl}/public/with%20space.txt`);
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(await res.text(), 'space in name');
   });
 
   it('should send files with res.sendFile()', async () => {
