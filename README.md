@@ -156,7 +156,28 @@ process.on('SIGTERM', async () => {
 });
 ```
 
+### 6. TypeScript
+
+Type declarations ship with the package (`src/index.d.ts`); they need `@types/node` in your
+project. Route parameters are inferred from the path:
+
+```typescript
+import createApp, { type ErrorRequestHandler } from 'bareweb';
+
+const app = createApp();
+app.get('/users/:id/files/*path', (req, res) => {
+  res.json({ id: req.params.id, file: req.params.path }); // both typed as string
+});
+
+// TypeScript can't infer inline 4-argument error handlers through overloads: type them
+const onError: ErrorRequestHandler = (err, req, res, next) => res.status(500).json({ error: String(err) });
+app.use(onError);
+```
+
 ### Notes
+
+- **Breaking:** constructor options are exposed as `app.settings` / `router.settings` (they
+  were `app.options`, which shadowed the `app.options(path, ...handlers)` route method).
 
 - `HEAD` requests fall back to the matching `GET` route.
 - `next('route')` skips the remaining handlers of the current route and continues with the next
@@ -180,6 +201,8 @@ BareWeb uses Node.js native test runner (`node:test`) requiring zero third-party
 ```bash
 npm test
 ```
+
+`npm run typecheck` compiles `test/types/usage.ts` against the type declarations.
 
 ---
 

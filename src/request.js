@@ -127,7 +127,7 @@ export class BareRequest extends http.IncomingMessage {
 
   /** Whether X-Forwarded-* headers may be trusted (see the `trustProxy` app option). */
   get _trustProxy() {
-    return Boolean(this.app && this.app.options && this.app.options.trustProxy);
+    return Boolean(this.app && this.app.settings && this.app.settings.trustProxy);
   }
 
   get ip() {

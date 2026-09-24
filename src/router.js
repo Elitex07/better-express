@@ -20,10 +20,10 @@ function normalizePrefix(prefix) {
 export class Router {
   /**
    * @param {object} [options]
-   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   * @param {number} [options.maxBacktracks] Deprecated and ignored: route search needs no cap
    */
   constructor(options = {}) {
-    this.options = options;
+    this.settings = options;
 
     /**
      * This router's own registrations, in order. Mounted routers appear as a single
@@ -148,7 +148,7 @@ export class Router {
 
     let ownTrie = this._ownTrees.get(upperMethod);
     if (!ownTrie) {
-      ownTrie = new Trie(this.options);
+      ownTrie = new Trie(this.settings);
       this._ownTrees.set(upperMethod, ownTrie);
     }
     ownTrie.insert(path, flatHandlers);
@@ -185,9 +185,9 @@ export class Router {
    */
   _compile() {
     const trees = new Map();
-    for (const method of HTTP_METHODS) trees.set(method, new Trie(this.options));
+    for (const method of HTTP_METHODS) trees.set(method, new Trie(this.settings));
     // Every route regardless of method: lets allowedMethods() rule out a path in one lookup
-    const anyMethod = new Trie(this.options);
+    const anyMethod = new Trie(this.settings);
     const middlewareEntries = [];
     const routes = [];
     const middlewares = [];
@@ -210,7 +210,7 @@ export class Router {
           const path = joinPaths(base, entry.path);
           let trie = trees.get(entry.method);
           if (!trie) {
-            trie = new Trie(this.options);
+            trie = new Trie(this.settings);
             trees.set(entry.method, trie);
           }
           const routeEntry = { type: 'route', id: ++seq, method: entry.method, path, handlers: entry.handlers };

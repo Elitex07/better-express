@@ -7,7 +7,7 @@ import { BareResponse, decorateResponse } from './response.js';
 export class BareWeb {
   /**
    * @param {object} [options]
-   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   * @param {number} [options.maxBacktracks] Deprecated and ignored: route search needs no cap
    * @param {boolean} [options.trustProxy=false] Trust X-Forwarded-For / -Proto / -Host headers
    *   for req.ip, req.protocol and req.hostname. Enable only behind a reverse proxy.
    * @param {boolean} [options.methodNotAllowed=true] Answer 405 (with an Allow header) when the
@@ -20,7 +20,7 @@ export class BareWeb {
    *   (Node default 300000). `0` disables it.
    */
   constructor(options = {}) {
-    this.options = options;
+    this.settings = options;
     this.router = new Router(options);
     this.server = null;
     this._closing = false;
@@ -120,7 +120,7 @@ export class BareWeb {
    */
   _noMatch(req, res) {
     if (res.headersSent) return;
-    if (this.options.methodNotAllowed !== false) {
+    if (this.settings.methodNotAllowed !== false) {
       const allowed = this.router.allowedMethods(req.path);
       // The method has routes here but all of them passed with next('route'): plain 404
       if (allowed.length > 0 && !allowed.includes(req.method)) {
@@ -168,7 +168,7 @@ export class BareWeb {
       this.handle
     );
     for (const key of ['keepAliveTimeout', 'headersTimeout', 'requestTimeout']) {
-      if (this.options[key] !== undefined) this.server[key] = this.options[key];
+      if (this.settings[key] !== undefined) this.server[key] = this.settings[key];
     }
     this._closing = false;
     // Without a host, Node listens on :: (IPv4 + IPv6) when available

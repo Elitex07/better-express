@@ -133,9 +133,9 @@ describe('Trie Route Matching', () => {
     );
   });
 
-  it('should bound backtracking on adversarial ambiguous route tables without hanging or exploding', () => {
-    const trie = new Trie({ maxBacktracks: 100 });
-    const n = 16;
+  it('should stay linear in the route table on adversarial ambiguous misses', () => {
+    const trie = new Trie();
+    const n = 16; // 65,536 routes, static/param siblings at every level
 
     // Generate adversarial tree with static and param siblings at every level
     function insertCombos(prefix, depth) {
@@ -156,6 +156,42 @@ describe('Trie Route Matching', () => {
 
     assert.strictEqual(match, null);
     assert.ok(duration < 50, `Expected search under 50ms, took ${duration.toFixed(2)}ms`);
+  });
+
+  it('should find a valid route that needs deep backtracking (no backtrack cap)', () => {
+    // Every static-first branch dead-ends at the last segment; only the all-param route
+    // matches, after ~2^n failed branches. The old 500-step cap turned this into a 404.
+    const trie = new Trie({ maxBacktracks: 1 }); // accepted, ignored
+    const n = 10;
+    (function insertCombos(prefix, depth) {
+      if (depth === n) {
+        trie.insert(prefix + '/endpoint', [() => 'combo']);
+        return;
+      }
+      insertCombos(prefix + '/a', depth + 1);
+      insertCombos(prefix + '/:p' + depth, depth + 1);
+    })('', 0);
+    const target = () => 'other';
+    trie.insert('/' + Array.from({ length: n }, (_, i) => ':q' + i).join('/') + '/other', [target]);
+
+    const match = trie.search('/' + Array(n).fill('a').join('/') + '/other');
+    assert.ok(match, 'expected the all-param route to match');
+    assert.ok(match.handlers.includes(target));
+    assert.strictEqual(match.params.q9, 'a');
+  });
+
+  it('should keep static > param priority when backtracking', () => {
+    const trie = new Trie();
+    const staticDeep = () => 'static';
+    const paramDeep = () => 'param';
+    trie.insert('/users/me/settings', [staticDeep]);
+    trie.insert('/users/:id/profile', [paramDeep]);
+
+    assert.strictEqual(trie.search('/users/me/settings').handlers[0], staticDeep);
+    // Static "me" branch has no /profile: falls back to :id
+    const fallback = trie.search('/users/me/profile');
+    assert.strictEqual(fallback.handlers[0], paramDeep);
+    assert.strictEqual(fallback.params.id, 'me');
   });
 });
 

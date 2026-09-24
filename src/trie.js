@@ -4,8 +4,11 @@
  * - Fully static routes are also indexed in a Map, so the common case is a single
  *   hash lookup with no path splitting at all.
  * - Dynamic lookups walk the trie in O(K) (K = path segments) for unambiguous
- *   tables. Static > :param > *wildcard priority; backtracking between ambiguous
- *   static/param siblings is bounded by `maxBacktracks`.
+ *   tables. Static > :param > *wildcard priority, with backtracking when a static
+ *   branch dead-ends. The trie is a tree and every node sits at a fixed depth, so a
+ *   search visits each node at most once: a miss costs at most O(trie size), never
+ *   more than scanning the route table, whatever the request path. No cap is needed,
+ *   and a cap would 404 valid routes in large ambiguous tables.
  */
 
 export class TrieNode {
@@ -30,12 +33,11 @@ function decode(value) {
 
 export class Trie {
   /**
-   * @param {object} [options]
-   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps before aborting ambiguous branch exploration
+   * @param {object} [options] Accepted for compatibility; `maxBacktracks` is ignored
+   *   (see the complexity note above).
    */
   constructor(options = {}) {
     this.root = new TrieNode();
-    this.maxBacktracks = options.maxBacktracks ?? 500;
     /** @type {Map<string, TrieNode>} normalized static path -> node */
     this.staticRoutes = new Map();
   }
@@ -134,7 +136,7 @@ export class Trie {
 
     if (node === undefined) {
       segments = Trie.splitPath(pathname);
-      node = this._searchNode(this.root, segments, 0, { backtracks: 0 });
+      node = this._searchNode(this.root, segments, 0);
       if (!node) return null;
     }
 
@@ -171,7 +173,7 @@ export class Trie {
     return { handlers, handlersWithParams, params, matches, routeEntries, routes: node.routes };
   }
 
-  _searchNode(node, segments, index, state) {
+  _searchNode(node, segments, index) {
     // Reached the end of segments
     if (index === segments.length) {
       if (node.routes.length > 0) return node;
@@ -187,17 +189,13 @@ export class Trie {
     // 1. Exact static match first
     const staticChild = node.staticChildren.get(segment);
     if (staticChild !== undefined) {
-      const match = this._searchNode(staticChild, segments, index + 1, state);
+      const match = this._searchNode(staticChild, segments, index + 1);
       if (match) return match;
     }
 
     // 2. Parameterized match (:param)
     if (node.paramChild) {
-      // Falling back from a failed static branch counts as a backtrack
-      if (staticChild !== undefined && ++state.backtracks > this.maxBacktracks) {
-        return null;
-      }
-      const match = this._searchNode(node.paramChild, segments, index + 1, state);
+      const match = this._searchNode(node.paramChild, segments, index + 1);
       if (match) return match;
     }
 

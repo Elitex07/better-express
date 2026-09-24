@@ -10,7 +10,7 @@ BareWeb is a zero-dependency, Express-style HTTP framework on top of `node:http`
 | --- | --- | --- |
 | App | `src/app.js` | `createApp()`, `use()`, method helpers, `handle(req, res)` dispatcher, `listen()` |
 | Router | `src/router.js` | Keeps a registration-ordered `stack` of middlewares + routes, one `Trie` per HTTP method, sub-router mounting |
-| Trie | `src/trie.js` | Segment trie: static > `:param` > `*wildcard`, bounded backtracking |
+| Trie | `src/trie.js` | Segment trie: static > `:param` > `*wildcard`, backtracking visits each node at most once |
 | Request | `src/request.js` | `req.params/query/cookies/ip/...`, streaming body readers with size limits |
 | Response | `src/response.js` | `res.status/json/send/html/redirect/cookie/sendFile` |
 | Middleware | `src/middleware.js` | Pipeline runner, default error handler, `cors`, `serveStatic`, `json`, `urlencoded` |
@@ -144,14 +144,24 @@ _Done in the follow-up change:_
   string was treated as an error. When the last route entered bails out and nothing responds,
   the request gets a 404 (not a 405). It only moves between routes at the matched trie node
   (same path pattern), not to less specific patterns.
+- ~~**TypeScript declarations.**~~ Hand-written `src/index.d.ts`, wired through `types` and the
+  `exports` `types` condition, with `req.params` inferred from route path literals.
+  `npm run typecheck` compiles `test/types/usage.ts` (including `@ts-expect-error` negative
+  cases). Inline 4-argument error handlers need annotations, as with Express's types.
+- ~~**Trie backtracking bound.**~~ The `maxBacktracks` cap is gone (the option is accepted and
+  ignored). The trie is a tree and each node sits at a fixed depth, so a search visits every
+  node at most once: a miss is bounded by the trie size (≈6 ms for an adversarial
+  65,536-route table), never exponential in the request path. With the cap, a valid route
+  behind more than 500 failed static branches returned 404; a regression test covers that.
+  (The cap had been removed once before, in `35e10fb`, and came back with the `f489113` rewrite.)
+- ~~**`app.options()` / `router.options()`.**~~ Both threw "options is not a function": the
+  constructor's `this.options = options` shadowed the route method. Constructor options now
+  live on **`app.settings` / `router.settings`** (breaking for code that read `app.options`).
+  This was also fixed once before (`7fcbc2c`) and regressed in `f489113`.
 
 Still open:
 
 4. **Optional/regex params** for Express parity (and `next('route')` fallback to less specific
    patterns, which needs a multi-node trie search).
-5. **TypeScript declarations** (`index.d.ts`) for editor support.
-6. **Trie backtracking bound:** pathological static/param route tables can hit
-   `maxBacktracks` and 404 on a path that should match; consider precomputing
-   static-vs-param conflicts at insert time instead.
-7. **CI:** run `npm test` on Node 18/20/22 in GitHub Actions; publish benchmark results
+5. **CI:** run `npm test` and `npm run typecheck` on Node 18/20/22 in GitHub Actions; publish benchmark results
    from a dedicated machine rather than a shared VM.
