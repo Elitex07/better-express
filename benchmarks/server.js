@@ -1,110 +1,90 @@
 /**
- * Benchmark target server. Started by compare.js in a child process so the autocannon
- * client and the server under test never share an event loop.
+ * Benchmark target server. Run as a child process so the load generator does not
+ * share an event loop (or a CPU core) with the server under test.
  *
- *   node benchmarks/server.js <framework> <port>
+ *   node benchmarks/server.js <bareweb|express|node> <port>
+ *
+ * Every framework exposes the same scenarios:
+ *   GET  /test            static route, JSON response
+ *   GET  /users/:id       parameterized route
+ *   GET  /mw/test         route behind 5 no-op middlewares (prefix /mw)
+ *   GET  /r499            last route of a 500-route table
+ *   GET  /nope            unmatched route (404)
+ *   POST /echo            JSON body parse + echo
  */
-import http from 'node:http';
-import express from 'express';
-import Fastify from 'fastify';
-import Koa from 'koa';
-import KoaRouter from '@koa/router';
-import koaBodyParser from 'koa-bodyparser';
-import { createApp } from '../src/index.js';
+const [, , framework = 'bareweb', portArg = '4000'] = process.argv;
+const PORT = Number(portArg);
+const ROUTE_TABLE_SIZE = 500;
 
-const [, , name, portArg] = process.argv;
-const PORT = Number(portArg) || 4100;
+const payload = () => ({ message: 'Hello from benchmark', timestamp: Date.now() });
+const noop = (req, res, next) => next();
 
-function listen(server) {
-  return new Promise((resolve) => server.listen(PORT, '127.0.0.1', () => resolve(server)));
+async function bareweb() {
+  const { createApp, Router, json } = await import('../src/index.js');
+  const app = createApp();
+  const mw = new Router();
+  for (let i = 0; i < 5; i++) mw.use(noop);
+  mw.get('/test', (req, res) => res.json(payload()));
+  app.get('/test', (req, res) => res.json(payload()));
+  app.get('/users/:id', (req, res) => res.json({ userId: req.params.id }));
+  app.use('/mw', mw);
+  for (let i = 0; i < ROUTE_TABLE_SIZE; i++) {
+    app.get(`/r${i}`, (req, res) => res.json({ route: i }));
+  }
+  app.post('/echo', json(), (req, res) => res.json(req.body));
+  return app.listen(PORT, '127.0.0.1');
 }
 
-const passthrough = (req, res, next) => next();
-const koaPassthrough = (ctx, next) => next();
-
-// ---------------------------------------------------------------------------
-// Framework factories: each returns a node http.Server listening on PORT
-// ---------------------------------------------------------------------------
-const FRAMEWORKS = {
-  'node:http': () => {
-    const server = http.createServer((req, res) => {
-      const url = req.url;
-      const send = (obj) => {
-        const payload = JSON.stringify(obj);
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.setHeader('Content-Length', Buffer.byteLength(payload));
-        res.end(payload);
-      };
-      if (req.method === 'GET' && url === '/test') return send({ message: 'Hello from benchmark', timestamp: Date.now() });
-      if (req.method === 'GET' && url === '/chain') return send({ ok: true });
-      if (req.method === 'GET' && url.startsWith('/users/')) return send({ userId: url.slice(7) });
-      if (req.method === 'POST' && url === '/echo') {
-        const chunks = [];
-        req.on('data', (c) => chunks.push(c));
-        req.on('end', () => { res.statusCode = 201; send({ received: JSON.parse(Buffer.concat(chunks).toString()) }); });
-        return;
-      }
-      res.statusCode = 404;
-      res.end();
-    });
-    return listen(server);
-  },
-
-  bareweb: () => {
-    const app = createApp();
-    app.get('/test', (req, res) => res.json({ message: 'Hello from benchmark', timestamp: Date.now() }));
-    app.get('/users/:id', (req, res) => res.json({ userId: req.params.id }));
-    app.post('/echo', async (req, res) => res.status(201).json({ received: await req.json() }));
-    app.get('/chain', passthrough, passthrough, passthrough, passthrough, passthrough, (req, res) => res.json({ ok: true }));
-    return listen(app.createServer());
-  },
-
-  express: () => {
-    const app = express();
-    app.get('/test', (req, res) => res.json({ message: 'Hello from benchmark', timestamp: Date.now() }));
-    app.get('/users/:id', (req, res) => res.json({ userId: req.params.id }));
-    app.post('/echo', express.json(), (req, res) => res.status(201).json({ received: req.body }));
-    app.get('/chain', passthrough, passthrough, passthrough, passthrough, passthrough, (req, res) => res.json({ ok: true }));
-    return listen(http.createServer(app));
-  },
-
-  fastify: async () => {
-    const app = Fastify({ logger: false });
-    app.get('/test', async () => ({ message: 'Hello from benchmark', timestamp: Date.now() }));
-    app.get('/users/:id', async (req) => ({ userId: req.params.id }));
-    app.post('/echo', async (req, reply) => { reply.code(201); return { received: req.body }; });
-    const hook = async () => {};
-    app.get('/chain', { preHandler: [hook, hook, hook, hook, hook] }, async () => ({ ok: true }));
-    await app.listen({ port: PORT, host: '127.0.0.1' });
-    return app.server;
-  },
-
-  koa: () => {
-    const app = new Koa();
-    const router = new KoaRouter();
-    router.get('/test', (ctx) => { ctx.body = { message: 'Hello from benchmark', timestamp: Date.now() }; });
-    router.get('/users/:id', (ctx) => { ctx.body = { userId: ctx.params.id }; });
-    router.post('/echo', koaBodyParser(), (ctx) => { ctx.status = 201; ctx.body = { received: ctx.request.body }; });
-    router.get('/chain', koaPassthrough, koaPassthrough, koaPassthrough, koaPassthrough, koaPassthrough, (ctx) => { ctx.body = { ok: true }; });
-    app.use(router.routes());
-    return listen(http.createServer(app.callback()));
+async function express() {
+  const { default: expressFn } = await import('express');
+  const app = expressFn();
+  app.disable('x-powered-by');
+  app.disable('etag');
+  const mw = expressFn.Router();
+  for (let i = 0; i < 5; i++) mw.use(noop);
+  mw.get('/test', (req, res) => res.json(payload()));
+  app.get('/test', (req, res) => res.json(payload()));
+  app.get('/users/:id', (req, res) => res.json({ userId: req.params.id }));
+  app.use('/mw', mw);
+  for (let i = 0; i < ROUTE_TABLE_SIZE; i++) {
+    app.get(`/r${i}`, (req, res) => res.json({ route: i }));
   }
-};
+  app.post('/echo', expressFn.json(), (req, res) => res.json(req.body));
+  return app.listen(PORT, '127.0.0.1');
+}
 
+async function node() {
+  const http = await import('node:http');
+  const send = (res, status, obj) => {
+    const body = JSON.stringify(obj);
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': Buffer.byteLength(body)
+    });
+    res.end(body);
+  };
+  const server = http.createServer((req, res) => {
+    const q = req.url.indexOf('?');
+    const path = q === -1 ? req.url : req.url.slice(0, q);
+    if (req.method === 'POST' && path === '/echo') {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => send(res, 200, JSON.parse(Buffer.concat(chunks).toString())));
+      return;
+    }
+    if (path === '/test' || path === '/mw/test') return send(res, 200, payload());
+    if (path.startsWith('/users/')) return send(res, 200, { userId: path.slice(7) });
+    if (path.startsWith('/r')) return send(res, 200, { route: Number(path.slice(2)) });
+    send(res, 404, { error: 'not found' });
+  });
+  return server.listen(PORT, '127.0.0.1');
+}
 
-export { FRAMEWORKS };
-
-if (!FRAMEWORKS[name]) {
-  console.error(`Unknown framework "${name}". Known: ${Object.keys(FRAMEWORKS).join(', ')}`);
+const targets = { bareweb, express, node };
+if (!targets[framework]) {
+  console.error(`Unknown framework "${framework}". Use one of: ${Object.keys(targets).join(', ')}`);
   process.exit(1);
 }
 
-const server = await FRAMEWORKS[name]();
-process.send?.({ ready: true, port: server.address().port });
-
-process.on('message', (msg) => {
-  if (msg === 'close') {
-    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
-    server.close(() => process.exit(0));
-  }
-});
+const server = await targets[framework]();
+server.on('listening', () => process.send?.('ready'));

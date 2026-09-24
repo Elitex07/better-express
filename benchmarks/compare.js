@@ -1,228 +1,132 @@
 /**
- * BareWeb benchmark suite.
+ * Benchmark suite: BareWeb vs Express.js vs raw node:http (and optionally Next.js).
  *
- * Compares BareWeb against a raw node:http baseline, Express, Fastify and Koa on four scenarios:
- *   1. static GET       /test
- *   2. param GET        /users/:id
- *   3. JSON POST echo   /echo            (body parsing)
- *   4. middleware chain /chain           (5 pass-through middlewares + route)
+ * Each server runs in its own child process, so autocannon never competes with the
+ * server under test for the same event loop.
  *
- * Methodology (designed to survive noisy laptops with thermal/frequency drift):
- *   - every framework runs in its own child process (benchmarks/server.js) on its own port, so
- *     the client never shares an event loop with a server under test;
- *   - every autocannon run is a fresh process (reusing one degrades ~4x on Windows);
- *   - trials are interleaved round-robin across frameworks, so slow drift hits all of them equally;
- *   - we report the MEDIAN req/s over trials (plus min/max) and median p99 latency.
- *
- * Usage:
- *   node benchmarks/compare.js                # all frameworks, all scenarios
- *   node benchmarks/compare.js --quick        # 1 trial, shorter durations
- *   node benchmarks/compare.js --md           # also print a Markdown table (for BENCHMARKS.md)
- *   BENCH_FRAMEWORKS=bareweb,express node benchmarks/compare.js
+ * Env knobs:
+ *   BENCH_DURATION=5      seconds per trial
+ *   BENCH_TRIALS=3        trials per scenario (mean is reported)
+ *   BENCH_CONNECTIONS=50  concurrent connections
+ *   BENCH_WORKERS=0       autocannon worker threads (use 2+ on multi-core machines, otherwise
+ *                         the load generator, not the server, becomes the bottleneck)
+ *   BENCH_ONLY=bareweb,express   subset of frameworks
+ *   NEXT_URL=http://127.0.0.1:3000   an already running `next start` app that serves
+ *                                    GET /test and GET /users/[id] route handlers
  */
-import { execFile, fork } from 'node:child_process';
-import { createRequire } from 'node:module';
-import os from 'node:os';
+import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import autocannon from 'autocannon';
 
-const require = createRequire(import.meta.url);
-const AUTOCANNON_BIN = require.resolve('autocannon/autocannon.js');
-
-const FRAMEWORK_NAMES = ['node:http', 'bareweb', 'express', 'fastify', 'koa'];
+const DURATION = Number(process.env.BENCH_DURATION || 5);
+const WARMUP_DURATION = 2;
+const TRIALS = Number(process.env.BENCH_TRIALS || 3);
+const CONNECTIONS = Number(process.env.BENCH_CONNECTIONS || 50);
+const WORKERS = Number(process.env.BENCH_WORKERS || 0);
 const SERVER_SCRIPT = fileURLToPath(new URL('./server.js', import.meta.url));
 
-const QUICK = process.argv.includes('--quick');
-const MARKDOWN = process.argv.includes('--md');
-const WARMUP_DURATION = QUICK ? 1 : 2;
-const DURATION = QUICK ? 2 : 5;
-const TRIALS = QUICK ? 1 : 3;
-const CONNECTIONS = 50;
-const COOLDOWN_MS = 1000;
-const BASE_PORT = 4100;
-const JSON_BODY = JSON.stringify({ name: 'Mechanical Keyboard', price: 149, tags: ['input', 'usb'] });
+const FRAMEWORKS = [
+  { name: 'node:http', key: 'node', port: 4000 },
+  { name: 'Express', key: 'express', port: 4001 },
+  { name: 'BareWeb', key: 'bareweb', port: 4002 }
+].filter((f) => !process.env.BENCH_ONLY || process.env.BENCH_ONLY.split(',').includes(f.key));
 
 const SCENARIOS = [
-  { name: 'static GET /test', path: '/test' },
-  { name: 'param GET /users/:id', path: '/users/123' },
-  { name: 'JSON POST /echo', path: '/echo', method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON_BODY },
-  { name: '5 middleware GET /chain', path: '/chain' }
+  { name: 'Static route', path: '/test' },
+  { name: 'Param route', path: '/users/123' },
+  { name: '5 middlewares', path: '/mw/test' },
+  { name: '500-route table', path: '/r499' },
+  { name: '404', path: '/nope' },
+  {
+    name: 'POST JSON',
+    path: '/echo',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'bench', tags: ['a', 'b', 'c'], nested: { n: 1 } })
+  }
 ];
 
-function startServer(name, port) {
+function startServer(key, port) {
   return new Promise((resolve, reject) => {
-    const child = fork(SERVER_SCRIPT, [name, String(port)], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
-    const timer = setTimeout(() => reject(new Error(`${name}: server did not start within 10s`)), 10000);
-    child.once('message', (msg) => {
-      if (msg && msg.ready) {
-        clearTimeout(timer);
-        resolve(child);
-      }
-    });
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`${name}: server exited early with code ${code}`));
-    });
+    const child = fork(SERVER_SCRIPT, [key, String(port)], { stdio: 'inherit' });
+    child.once('message', (msg) => msg === 'ready' && resolve(child));
+    child.once('error', reject);
+    child.once('exit', (code) => reject(new Error(`${key} server exited with code ${code}`)));
   });
 }
 
-function stopServer(child) {
-  return new Promise((resolve) => {
-    child.once('exit', resolve);
-    child.send('close');
-    setTimeout(() => child.kill(), 3000).unref();
-  });
-}
-
-/**
- * Run autocannon in a fresh child process and parse its JSON report.
- * Reusing the programmatic API inside one long-lived process degrades throughput ~4x after the
- * first run on Windows, so every run gets its own process.
- */
-function runAutocannon(port, scenario, duration) {
-  const args = [
-    AUTOCANNON_BIN,
-    '-c', String(CONNECTIONS),
-    '-d', String(duration),
-    '-p', '1',
-    '-m', scenario.method || 'GET',
-    '-j'
-  ];
-  for (const [k, v] of Object.entries(scenario.headers || {})) args.push('-H', `${k}=${v}`);
-  if (scenario.body) args.push('-b', scenario.body);
-  args.push(`http://127.0.0.1:${port}${scenario.path}`);
-
+function run(opts, duration) {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, args, { maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(`autocannon failed: ${err.message}
-${stderr}`));
-      try {
-        resolve(JSON.parse(stdout));
-      } catch (parseErr) {
-        reject(new Error(`could not parse autocannon output: ${parseErr.message}
-${stdout.slice(0, 500)}`));
-      }
-    });
+    const workers = WORKERS > 0 ? { workers: WORKERS } : {};
+    autocannon({ connections: CONNECTIONS, pipelining: 1, duration, ...workers, ...opts }, (err, result) =>
+      err ? reject(err) : resolve(result)
+    );
   });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const median = (arr) => {
-  const sorted = [...arr].sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-};
-
-function summarise(results) {
-  const reqs = results.map((r) => r.requests.average);
+async function measure(baseUrl, scenario) {
+  const opts = {
+    url: baseUrl + scenario.path,
+    method: scenario.method || 'GET',
+    headers: scenario.headers,
+    body: scenario.body
+  };
+  await run(opts, WARMUP_DURATION);
+  const results = [];
+  for (let i = 0; i < TRIALS; i++) results.push(await run(opts, DURATION));
+  const mean = (fn) => results.reduce((acc, r) => acc + fn(r), 0) / results.length;
   return {
-    reqSec: Math.round(median(reqs)),
-    min: Math.round(Math.min(...reqs)),
-    max: Math.round(Math.max(...reqs)),
-    latency: Number(median(results.map((r) => r.latency.average)).toFixed(2)),
-    p99: Number(median(results.map((r) => r.latency.p99)).toFixed(2))
+    reqSec: Math.round(mean((r) => r.requests.average)),
+    p99: Number(mean((r) => r.latency.p99).toFixed(2)),
+    errors: results.reduce((acc, r) => acc + r.errors + r.non2xx, 0)
   };
 }
 
 async function main() {
-  const selected = (process.env.BENCH_FRAMEWORKS || FRAMEWORK_NAMES.join(','))
-    .split(',').map((s) => s.trim()).filter((s) => FRAMEWORK_NAMES.includes(s));
+  console.log(`Trials: ${TRIALS} x ${DURATION}s | Warmup: ${WARMUP_DURATION}s | Connections: ${CONNECTIONS} | Workers: ${WORKERS}\n`);
 
-  console.log('====================================================');
-  console.log('BareWeb Benchmark Suite');
-  console.log(`Node ${process.version} | ${os.cpus()[0]?.model || 'unknown CPU'} x${os.cpus().length} | ${os.platform()} ${os.release()}`);
-  console.log(`Frameworks: ${selected.join(', ')}`);
-  console.log(`Trials: ${TRIALS} x ${DURATION}s (interleaved) | Warmup: ${WARMUP_DURATION}s | Connections: ${CONNECTIONS}`);
-  console.log('====================================================\n');
-
-  const servers = new Map(); // name -> { child, port }
-  for (let i = 0; i < selected.length; i++) {
-    const port = BASE_PORT + i;
-    servers.set(selected[i], { child: await startServer(selected[i], port), port });
-  }
-
-  /** @type {Record<string, Record<string, import('autocannon').Result[]>>} scenario -> framework -> raw results */
-  const raw = {};
-
+  const targets = [];
+  const rows = [];
   try {
-    for (const scenario of SCENARIOS) {
-      console.log(`--- ${scenario.name} ---`);
-      process.stdout.write('  warmup: ');
-      for (const name of selected) {
-        await runAutocannon(servers.get(name).port, scenario, WARMUP_DURATION);
-        process.stdout.write(`${name} `);
-      }
-      console.log();
+    // Inside try: if a later server fails to start, the earlier ones are still killed
+    for (const fw of FRAMEWORKS) {
+      targets.push({ ...fw, url: `http://127.0.0.1:${fw.port}`, child: await startServer(fw.key, fw.port) });
+    }
+    if (process.env.NEXT_URL) {
+      targets.push({ name: 'Next.js', url: process.env.NEXT_URL, only: ['/test', '/users/123'] });
+    }
 
-      for (let trial = 1; trial <= TRIALS; trial++) {
-        process.stdout.write(`  trial ${trial}/${TRIALS}: `);
-        for (const name of selected) {
-          // Let the previous run's sockets drain so TIME_WAIT churn does not bleed into this one
-          await sleep(COOLDOWN_MS);
-          const res = await runAutocannon(servers.get(name).port, scenario, DURATION);
-          if (res.non2xx > 0 || res.errors > 0) {
-            throw new Error(`${name} ${scenario.name}: ${res.non2xx} non-2xx, ${res.errors} errors - fix the harness before trusting numbers`);
-          }
-          ((raw[scenario.name] ||= {})[name] ||= []).push(res);
-          process.stdout.write(`${name}=${Math.round(res.requests.average)} `);
+    for (const scenario of SCENARIOS) {
+      const row = { Scenario: scenario.name };
+      for (const target of targets) {
+        if (target.only && !target.only.includes(scenario.path)) {
+          row[target.name] = '-';
+          continue;
         }
-        console.log();
+        process.stdout.write(`  ${scenario.name} @ ${target.name}... `);
+        const r = await measure(target.url, scenario);
+        // 404 scenario is expected to be non-2xx; ignore those counts there.
+        const errNote = r.errors && scenario.path !== '/nope' ? ` (${r.errors} errors)` : '';
+        console.log(`${r.reqSec} req/s, p99 ${r.p99}ms${errNote}`);
+        row[target.name] = `${r.reqSec} (p99 ${r.p99}ms)`;
+        target[scenario.name] = r.reqSec;
       }
-      console.log();
+      rows.push(row);
     }
   } finally {
-    await Promise.all([...servers.values()].map(({ child }) => stopServer(child)));
+    for (const t of targets) t.child?.kill();
   }
 
-  /** scenario -> framework -> summary */
-  const table = {};
-  for (const scenario of SCENARIOS) {
-    table[scenario.name] = {};
-    for (const name of selected) table[scenario.name][name] = summarise(raw[scenario.name][name]);
-  }
-
-  console.log('====================================================');
-  console.log('Summary (median req/s over interleaved trials; higher is better)');
-  console.log('====================================================\n');
-
-  const rows = [];
-  for (const scenario of SCENARIOS) {
-    for (const name of selected) {
-      const s = table[scenario.name][name];
-      rows.push({
-        Scenario: scenario.name,
-        Framework: name,
-        'Req/s (median)': s.reqSec,
-        'min..max': `${s.min}..${s.max}`,
-        'Avg ms': s.latency,
-        'p99 ms': s.p99
-      });
-    }
-  }
+  console.log('\nRequests/sec (mean), p99 latency');
   console.table(rows);
 
-  if (selected.includes('bareweb')) {
-    console.log('BareWeb relative throughput:');
-    for (const scenario of SCENARIOS) {
-      const bw = table[scenario.name].bareweb.reqSec;
-      const parts = selected.filter((n) => n !== 'bareweb').map((n) => {
-        const other = table[scenario.name][n].reqSec;
-        const delta = ((bw / other - 1) * 100).toFixed(1);
-        return `${n} ${delta >= 0 ? '+' : ''}${delta}%`;
-      });
-      console.log(`  ${scenario.name.padEnd(26)} ${parts.join(' | ')}`);
-    }
-  }
-
-  if (MARKDOWN) {
-    console.log('\n--- Markdown ---\n');
-    console.log(`| Scenario | ${selected.join(' | ')} |`);
-    console.log(`|---|${selected.map(() => '---:').join('|')}|`);
-    for (const scenario of SCENARIOS) {
-      const cells = selected.map((n) => {
-        const s = table[scenario.name][n];
-        return `**${s.reqSec.toLocaleString('en-US')}** (p99 ${s.p99}ms)`;
-      });
-      console.log(`| ${scenario.name} | ${cells.join(' | ')} |`);
+  const bare = targets.find((t) => t.key === 'bareweb');
+  const exp = targets.find((t) => t.key === 'express');
+  if (bare && exp) {
+    console.log('\nBareWeb vs Express:');
+    for (const s of SCENARIOS) {
+      const delta = ((bare[s.name] / exp[s.name] - 1) * 100).toFixed(1);
+      console.log(`  ${s.name.padEnd(16)} ${delta >= 0 ? '+' : ''}${delta}%`);
     }
   }
 }
