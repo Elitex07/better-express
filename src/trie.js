@@ -43,6 +43,69 @@ function decode(value) {
   }
 }
 
+/**
+ * Whether a regex source repeats a group that itself contains an unbounded quantifier,
+ * e.g. `(a+)+`, `(\d*)*`, `(?:x+){2,}`. Those nest backtracking and can take exponential
+ * time on a crafted, nearly matching segment, blocking the event loop. Heuristic: it does
+ * not catch overlapping alternations such as `(a|a)*`.
+ * @param {string} source
+ */
+export function hasNestedQuantifier(source) {
+  // Per open group: whether an unbounded quantifier appeared inside it
+  const stack = [];
+  let lastGroupRepeats = false; // the group that just closed contained a quantifier
+  const isUnbounded = (i) => {
+    const ch = source[i];
+    if (ch === '*' || ch === '+') return true;
+    if (ch !== '{') return false;
+    const close = source.indexOf('}', i);
+    if (close === -1) return false;
+    const body = source.slice(i + 1, close);
+    // {n,} and {n,m} with m > 1 repeat; {n} and {0,1} do not add backtracking choices
+    const m = /^(\d+)(,(\d*))?$/.exec(body);
+    return m !== null && m[2] !== undefined && (m[3] === '' || Number(m[3]) > 1);
+  };
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === '\\') {
+      i++;
+      lastGroupRepeats = false;
+      continue;
+    }
+    if (ch === '[') {
+      // Skip the character class (a "]" right after "[" or "[^" is literal)
+      let j = i + 1;
+      if (source[j] === '^') j++;
+      if (source[j] === ']') j++;
+      while (j < source.length && source[j] !== ']') {
+        if (source[j] === '\\') j++;
+        j++;
+      }
+      i = j;
+      lastGroupRepeats = false;
+      continue;
+    }
+    if (ch === '(') {
+      stack.push(false);
+      lastGroupRepeats = false;
+      continue;
+    }
+    if (ch === ')') {
+      const inner = stack.pop() ?? false;
+      if (inner && stack.length > 0) stack[stack.length - 1] = true;
+      lastGroupRepeats = inner;
+      continue;
+    }
+    if (isUnbounded(i)) {
+      if (lastGroupRepeats) return true;
+      if (stack.length > 0) stack[stack.length - 1] = true;
+    }
+    lastGroupRepeats = false;
+  }
+  return false;
+}
+
 /** Split a route definition on "/" outside parentheses, so regexes may contain "/". */
 function splitRoutePath(path) {
   const segments = [];
@@ -85,6 +148,13 @@ function expandRoute(path) {
       if (m) {
         let regex = null;
         if (m[2] !== undefined) {
+          if (hasNestedQuantifier(m[2])) {
+            throw new SyntaxError(
+              `Unsafe pattern for parameter ":${m[1]}" in route "${path}": a repeated group contains ` +
+              'another repetition (e.g. "(a+)+"), which can backtrack exponentially on crafted input. ' +
+              'Flatten it (e.g. "a+") or validate the value in the handler.'
+            );
+          }
           try {
             regex = new RegExp(`^(?:${m[2]})$`);
           } catch (err) {
@@ -113,9 +183,38 @@ function expandRoute(path) {
       next.push([...variant, token]);
       if (optional) next.push(variant);
     }
-    variants = next;
+    variants = optional ? dedupeVariants(next) : next;
+    if (variants.length > MAX_ROUTE_VARIANTS) {
+      throw new RangeError(
+        `Route "${path}" expands to more than ${MAX_ROUTE_VARIANTS} optional-parameter variants; ` +
+        'split it into several routes'
+      );
+    }
   }
   return variants;
+}
+
+// Each independent optional segment doubles the variants (8 -> 256)
+const MAX_ROUTE_VARIANTS = 256;
+
+/**
+ * Drop variants that match exactly the same paths as an earlier one: same static
+ * segments, params with the same constraint (names don't affect matching). The first
+ * variant wins, as it would at match time, so `/:a?/:b?/...` stays linear, not 2^n.
+ */
+function dedupeVariants(variants) {
+  const seen = new Set();
+  const kept = [];
+  for (const variant of variants) {
+    let key = '';
+    for (const t of variant) {
+      key += t.type === 'static' ? `/s:${t.value}` : t.type === 'param' ? `/p:${t.regex ? t.regex.source : ''}` : '/*';
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    kept.push(variant);
+  }
+  return kept;
 }
 
 /** Whether `route` accepts the request segments (only its :param(regex) constraints can fail). */

@@ -10,6 +10,7 @@ import createApp, {
   urlencoded,
   DEFAULT_BODY_LIMIT,
   MIME_TYPES,
+  MiddlewareStack,
   type Request,
   type Response,
   type NextFunction,
@@ -149,6 +150,18 @@ void app.close();
 void app.close({ timeout: 5000 });
 app.close((err) => { if (err) console.error(err); });
 app.close({ timeout: 1 }, () => {});
+
+// Standalone MiddlewareStack: req.app is optional there
+const stack = new MiddlewareStack();
+stack.use((req, res, next) => {
+  const trust = req.app?.settings.trustProxy;
+  // @ts-expect-error req.app may be undefined outside an app
+  req.app.settings;
+  void trust;
+  next();
+});
+// @ts-expect-error app handlers (typed with a guaranteed req.app) can't run standalone
+stack.use((req: Request, res: Response, next: NextFunction) => { req.app.settings; next(); });
 
 const mime: string | undefined = MIME_TYPES['.json'];
 const next: NextFunction = () => {};

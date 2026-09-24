@@ -232,8 +232,10 @@ export class BareWeb {
     this._closing = true;
     return new Promise((resolve, reject) => {
       let timer;
+      let sweep;
       server.close((err) => {
         clearTimeout(timer);
+        clearInterval(sweep);
         if (this.server === server) {
           this.server = null;
           this._closing = false;
@@ -248,7 +250,13 @@ export class BareWeb {
         }
       });
       // Node >= 19 does this inside close(); older versions keep idle sockets open
-      if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+      if (typeof server.closeIdleConnections === 'function') {
+        server.closeIdleConnections();
+        // Responses whose headers went out before close() keep keep-alive; once they finish
+        // their sockets sit idle until the client's timeout. Sweep them while shutting down.
+        sweep = setInterval(() => server.closeIdleConnections(), 50);
+        sweep.unref();
+      }
 
       if (options.timeout !== undefined && typeof server.closeAllConnections === 'function') {
         timer = setTimeout(() => server.closeAllConnections(), options.timeout);

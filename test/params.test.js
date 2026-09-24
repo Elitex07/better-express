@@ -90,6 +90,62 @@ describe('Express 4 parameter syntax (trie)', () => {
     assert.throws(() => trie.insert('/x/:id([)', [handler('bad')]), /Invalid pattern for parameter ":id"/);
   });
 
+  it('keeps optional-param expansion linear for runs of optional segments', () => {
+    const trie = new Trie();
+    const names = Array.from({ length: 20 }, (_, i) => `p${i}`);
+    const start = performance.now();
+    trie.insert('/' + names.map((n) => `:${n}?`).join('/'), [handler('many')]);
+    assert.ok(performance.now() - start < 100);
+
+    let records = 0;
+    (function count(node) {
+      records += node.routes.length;
+      for (const child of node.staticChildren.values()) count(child);
+      if (node.paramChild) count(node.paramChild);
+    })(trie.root);
+    assert.equal(records, 21); // one per length, not 2^20
+
+    const match = trie.search('/a/b');
+    assert.deepEqual(labels(match), ['many']);
+    assert.equal(match.params.p0, 'a');
+    assert.equal(match.params.p1, 'b');
+    assert.ok('p19' in match.params);
+  });
+
+  it('keeps variants whose constraints differ, and caps independent optionals', () => {
+    const trie = new Trie();
+    trie.insert('/:n(\\d+)?/:w([a-z]+)?', [handler('mixed')]);
+    assert.equal(trie.search('/42').params.n, '42');
+    assert.equal(trie.search('/abc').params.w, 'abc');
+
+    const independent = (count) => '/' + Array.from({ length: count }, (_, i) => `s${i}/:q${i}?`).join('/');
+    assert.doesNotThrow(() => trie.insert(independent(8), [handler('eight')]));
+    assert.throws(() => trie.insert(independent(9), [handler('nine')]), /more than 256 optional-parameter variants/);
+  });
+
+  it('rejects constraints with nested repetition (ReDoS) at registration', () => {
+    const trie = new Trie();
+    for (const pattern of ['(a+)+', '(a*)*', '(\\d+)*', '(?:x+){2,}', '((ab)+)+', '(a{1,})+', '([a-z]+)*', '(a+|b)+', '(?:\\w+\\s?)+']) {
+      assert.throws(() => trie.insert(`/x/:id(${pattern})`, [handler('bad')]), /Unsafe pattern for parameter ":id"/, pattern);
+    }
+    for (const pattern of ['\\d+', '[a-z-]+', '(foo|bar)+', '\\d{4}', '(a)+', '(a{2})+', '(a?)+', '[(+)]+', '\\(a+\\)+', '(?:x{0,1})+', 'a+b+', '\\d{4}-\\d{2}']) {
+      assert.doesNotThrow(() => trie.insert(`/y/:id(${pattern})`, [handler('ok')]), pattern);
+    }
+  });
+
+  it('the rejected shape really is catastrophic, the accepted flat form is not', () => {
+    const nested = /^(?:(a+)+)$/;
+    const flat = /^(?:a+)$/;
+    const input = 'a'.repeat(22) + '!';
+    let start = performance.now();
+    flat.test(input);
+    const flatMs = performance.now() - start;
+    start = performance.now();
+    nested.test(input);
+    const nestedMs = performance.now() - start;
+    assert.ok(nestedMs > flatMs * 50, `nested ${nestedMs.toFixed(2)}ms vs flat ${flatMs.toFixed(3)}ms`);
+  });
+
   it('keeps legacy param names that are not identifiers', () => {
     const trie = new Trie();
     trie.insert('/f/:file.ext', [handler('legacy')]);

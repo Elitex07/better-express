@@ -354,7 +354,9 @@ export function serveStatic(rootPath, options = {}) {
   const resolvedRoot = path.resolve(rootPath);
   let realRoot;
   try {
-    realRoot = fs.realpathSync(resolvedRoot);
+    // .native, like fs.promises.realpath used per request: the JS realpathSync keeps
+    // Windows 8.3 short names (RUNNER~1), which would put every file "outside" the root
+    realRoot = fs.realpathSync.native(resolvedRoot);
   } catch {
     realRoot = resolvedRoot;
   }

@@ -185,6 +185,14 @@ _Done in the follow-up change:_
   stripped) and URL fragments leaked into the path and query. Remaining differences from the
   old suite are deliberate (`Allow` lists `OPTIONS`; `Vary: Origin` for a fixed origin, as
   Express's `cors` does; `settings` naming; error wording).
+- ~~**Greptile review of PR #5.**~~ `trustProxy` lists now match IPv4-mapped peer
+  addresses (`::ffff:127.0.0.1` vs `127.0.0.1`), which a dual-stack listener reports for IPv4
+  proxies; route constraints with nested repetition (`(a+)+`) are rejected at registration
+  (ReDoS); optional-param variants are deduplicated by matching shape (20 adjacent optionals:
+  21 variants, not 2^20) and capped at 256; `MiddlewareStack` is typed with `StandaloneRequest`
+  (`req.app` optional); workflow actions are pinned to commit SHAs. CI on Windows also exposed
+  `serveStatic` 403s for 8.3 short-name roots (`realpathSync` vs native realpath) and a slow
+  graceful `close()` when a response was already streaming.
 
 Still open:
 

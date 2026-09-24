@@ -380,17 +380,35 @@ export function serveStatic(rootPath: string, options?: ServeStaticOptions): Req
 export function json(options?: BodyParserOptions): RequestHandler;
 export function urlencoded(options?: BodyParserOptions): RequestHandler;
 
-/** Standalone middleware runner; applications dispatch through Router directly. */
+/**
+ * A request run through `MiddlewareStack` outside an app: `req.app` is only set when the
+ * caller set it, unlike requests dispatched by `BareWeb`, which always have it.
+ */
+export type StandaloneRequest<P = ParamsDictionary, ReqBody = any> = Omit<Request<P, ReqBody>, 'app'> & {
+  app?: BareWeb;
+};
+
+export type StandaloneRequestHandler = (req: StandaloneRequest, res: Response, next: NextFunction) => unknown;
+export type StandaloneErrorRequestHandler = (err: any, req: StandaloneRequest, res: Response, next: NextFunction) => unknown;
+export type StandaloneHandler = StandaloneRequestHandler | StandaloneErrorRequestHandler;
+
+/**
+ * Standalone middleware runner; applications dispatch through Router directly.
+ * Handlers typed with `Request` (which promises `req.app`) are rejected here; type them
+ * as `StandaloneRequestHandler` instead.
+ */
 export class MiddlewareStack {
-  entries: Array<{ prefix: string; handler: Handler; isErrorHandler: boolean }>;
-  use(prefix: string, ...handlers: Array<Handler | Handler[]>): void;
-  use(...handlers: Array<Handler | Handler[]>): void;
-  run(req: Request, res: Response, routeHandlers?: Handler[], isRouteMatched?: boolean): Promise<void>;
+  entries: Array<{ prefix: string; handler: StandaloneHandler; isErrorHandler: boolean }>;
+  use(prefix: string, ...handlers: Many<StandaloneRequestHandler>): void;
+  use(...handlers: Many<StandaloneRequestHandler>): void;
+  use(prefix: string, ...handlers: Many<StandaloneHandler>): void;
+  use(...handlers: Many<StandaloneHandler>): void;
+  run(req: StandaloneRequest, res: Response, routeHandlers?: StandaloneHandler[], isRouteMatched?: boolean): Promise<void>;
   runPipeline(
-    req: Request,
+    req: StandaloneRequest,
     res: Response,
-    pipeline?: Array<Handler | PipelineItem>,
-    errorHandlers?: Array<Handler | PipelineItem>,
+    pipeline?: Array<StandaloneHandler | { prefix: string; handler: StandaloneHandler; route?: number }>,
+    errorHandlers?: Array<StandaloneHandler | { prefix: string; handler: StandaloneHandler; route?: number }>,
     isRouteMatched?: boolean
   ): Promise<void>;
 }

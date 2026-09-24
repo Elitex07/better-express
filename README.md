@@ -138,7 +138,8 @@ createApp({ trustProxy: ['10.0.0.2', '10.0.0.3'] });    // only these peer addre
 createApp({ trustProxy: (addr) => addr.startsWith('10.') });
 ```
 
-The setting lives on `app.settings.trustProxy` and can be changed at runtime.
+Addresses match whether the peer shows up as IPv4 or IPv4-mapped IPv6 (`::ffff:10.0.0.2`, as on
+a dual-stack listener). The setting lives on `app.settings.trustProxy` and can be changed at runtime.
 
 ### 5. Timeouts & Graceful Shutdown
 
@@ -193,6 +194,12 @@ app.get('/files/*path', ...);            // rest of the path: req.params.path an
 Constraints are anchored regexes tested against a single raw (percent-encoded) segment;
 params are still decoded. When a constraint rejects a segment, matching backtracks to other
 routes. Static segments beat `:params`, which beat `*wildcards`, regardless of registration order.
+
+Patterns with nested repetition such as `(a+)+` are rejected at registration, because a crafted
+segment could make them backtrack exponentially and block the event loop (the check is a
+heuristic; overlapping alternations like `(a|a)*` are not detected, so keep patterns simple).
+A route may have at most 8 *independent* optional segments (256 variants); runs of adjacent
+optional params like `/:a?/:b?/:c?` are cheap.
 
 ### 8. Precompressed Static Files
 

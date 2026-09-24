@@ -204,6 +204,27 @@ describe('trustProxy peer lists and predicates', () => {
     assert.equal((await ipWith('10.0.0.1, 10.0.0.2')).ip, '127.0.0.1');
   });
 
+  it('matches IPv4-mapped peer addresses against IPv4 entries (and vice versa)', async () => {
+    const { compileTrustProxy } = await import('../src/request.js');
+    const trust = compileTrustProxy(['127.0.0.1', '::FFFF:10.0.0.9']);
+    assert.equal(trust('::ffff:127.0.0.1'), true);
+    assert.equal(trust('10.0.0.9'), true);
+    assert.equal(trust('::ffff:10.0.0.8'), false);
+
+    // A dual-stack listener (no host) reports IPv4 peers as ::ffff:127.0.0.1
+    const app = createApp({ trustProxy: ['127.0.0.1'] });
+    echo(app);
+    const port = await new Promise((resolve) => {
+      const server = app.listen(0, () => resolve(server.address().port));
+    });
+    try {
+      const body = await (await fetch(`http://127.0.0.1:${port}/ip`, { headers: forwarded })).json();
+      assert.equal(body.ip, '203.0.113.9');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('predicates receive the peer address', async () => {
     const seen = [];
     const result = await ipWith((addr) => { seen.push(addr); return false; });

@@ -93,6 +93,34 @@ describe('Server lifecycle', () => {
     agent.destroy();
   });
 
+  it('closes keep-alive sockets whose response had already started when close() was called', async () => {
+    const app = createApp({ keepAliveTimeout: 60_000 });
+    let arrived;
+    const reached = new Promise((r) => { arrived = r; });
+    let finish;
+    app.get('/stream', (req, res) => {
+      res.setHeader('Content-Length', 4);
+      res.write('ab'); // headers are out: too late for Connection: close
+      arrived();
+      finish = () => res.end('cd');
+    });
+    const server = await listen(app);
+    const agent = new http.Agent({ keepAlive: true });
+
+    const pending = get(server.address().port, agent, '/stream');
+    await reached;
+    const closing = app.close();
+    finish();
+    const res = await pending;
+    assert.equal(res.body, 'abcd');
+    assert.equal(res.headers.connection, 'keep-alive');
+
+    const start = Date.now();
+    await closing;
+    assert.ok(Date.now() - start < 1000, `close() waited ${Date.now() - start}ms for an idle socket`);
+    agent.destroy();
+  });
+
   it('force-closes hung connections after the timeout', async () => {
     const app = createApp();
     let arrived;
