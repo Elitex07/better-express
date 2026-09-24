@@ -158,10 +158,15 @@ _Done in the follow-up change:_
   constructor's `this.options = options` shadowed the route method. Constructor options now
   live on **`app.settings` / `router.settings`** (breaking for code that read `app.options`).
   This was also fixed once before (`7fcbc2c`) and regressed in `f489113`.
+- ~~**CI.**~~ `.github/workflows/ci.yml`: `npm test` on Node 18/20/22/24 (Ubuntu) plus Node 24
+  on Windows and macOS, and a job running `npm run typecheck` and checking that
+  `src/index.d.ts` is in the packed tarball. `.github/workflows/benchmark.yml`: manual
+  benchmark run with the output in the job summary and as an artifact.
 
 Still open:
 
 4. **Optional/regex params** for Express parity (and `next('route')` fallback to less specific
    patterns, which needs a multi-node trie search).
-5. **CI:** run `npm test` and `npm run typecheck` on Node 18/20/22 in GitHub Actions; publish benchmark results
-   from a dedicated machine rather than a shared VM.
+5. **Benchmarks on dedicated hardware:** the manual Benchmark workflow runs on shared GitHub
+   runners, fine for relative comparisons within one run; published absolute numbers should
+   still come from a dedicated machine.

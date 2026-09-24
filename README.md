@@ -204,6 +204,12 @@ npm test
 
 `npm run typecheck` compiles `test/types/usage.ts` against the type declarations.
 
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the tests on
+Node 18, 20, 22 and 24 (Linux) plus Node 24 on Windows and macOS, and type-checks the
+declarations, on every push to `main` and every pull request. The **Benchmark** workflow
+runs `npm run benchmark` on demand (Actions → Benchmark → Run workflow) and attaches the
+results to the run; hosted runners are noisy, so compare frameworks within one run.
+
 ---
 
 ## 📊 Benchmarks
