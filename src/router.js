@@ -271,12 +271,13 @@ export class Router {
           pathname === mw.prefix ||
           pathname.startsWith(mw.prefixSlash)
         ) {
-          (mw.isErrorHandler ? errorHandlers : pipeline).push({ prefix: mw.prefix, handler: mw.handler });
+          (mw.isErrorHandler ? errorHandlers : pipeline).push({ prefix: mw.prefix, handler: mw.handler, params: undefined, route: 0 });
         }
       } else {
         r++;
         for (const handler of route.handlers) {
-          (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler, params: route.params });
+          // `route` groups a route's handlers so next('route') can skip the rest of them
+          (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler, params: route.params, route: route.routeEntry.id });
         }
       }
     }

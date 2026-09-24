@@ -159,6 +159,10 @@ process.on('SIGTERM', async () => {
 ### Notes
 
 - `HEAD` requests fall back to the matching `GET` route.
+- `next('route')` skips the remaining handlers of the current route and continues with the next
+  route registered for the same path pattern (e.g. `app.get('/user/:id', ...)` twice). Routes
+  are matched by specificity, so it does not fall back from `/users/me` to `/users/:id`. If
+  every matching route bails out, the response is a 404.
 - Mounting is live: routes and middleware added to a `Router` after `app.use('/x', router)` are
   picked up, and run at the position where the router was mounted.
 - When a path exists under other methods, BareWeb answers `405 Method Not Allowed` with an

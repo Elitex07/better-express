@@ -49,15 +49,32 @@ export function runPipeline(req, res, pipeline = [], errorHandlers = [], isRoute
     }
   };
 
+  // next('route') support: items of one route share a non-zero `route` id. If the last
+  // route entered bailed out with next('route') and nothing else responds, the request
+  // falls through to onNoMatch like an unmatched one.
+  let current = null;
+  let routeBailed = false;
+
   const next = (err) => {
-    if (err) return handleError(err);
+    if (err === 'route') {
+      const route = current !== null ? current.route : 0;
+      if (route) {
+        while (index < pipeline.length && pipeline[index].route === route) index++;
+        routeBailed = true;
+      }
+      // Outside a route handler next('route') behaves like next(), as in Express
+    } else if (err) {
+      return handleError(err);
+    }
 
     if (index >= pipeline.length) {
-      if (!isRouteMatched) onNoMatch(req, res);
+      if (!isRouteMatched || routeBailed) onNoMatch(req, res);
       return;
     }
 
     const item = pipeline[index++];
+    if (item.route) routeBailed = false;
+    current = item;
     req.baseUrl = item.prefix === '/' ? '' : item.prefix;
 
     let result;
@@ -149,7 +166,7 @@ export class MiddlewareStack {
     }
 
     for (const handler of routeHandlers) {
-      (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler });
+      (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler, route: 1 });
     }
 
     await runPipeline(req, res, pipeline, errorHandlers, isRouteMatched);

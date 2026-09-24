@@ -122,7 +122,8 @@ export class BareWeb {
     if (res.headersSent) return;
     if (this.options.methodNotAllowed !== false) {
       const allowed = this.router.allowedMethods(req.path);
-      if (allowed.length > 0) {
+      // The method has routes here but all of them passed with next('route'): plain 404
+      if (allowed.length > 0 && !allowed.includes(req.method)) {
         if (!allowed.includes('OPTIONS')) allowed.push('OPTIONS');
         res.setHeader('Allow', allowed.join(', '));
         if (req.method === 'OPTIONS') {

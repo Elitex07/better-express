@@ -139,10 +139,16 @@ _Done in the follow-up change:_
   options are applied to the server. `close()` is graceful: it closes idle keep-alive sockets,
   lets in-flight requests finish with `Connection: close` (checked in `BareResponse.writeHead`),
   optionally force-closes after `{ timeout }`, and returns a promise.
+- ~~**`next('route')`.**~~ Route handlers in the resolved pipeline carry their route id;
+  `next('route')` skips to the first item of another route or middleware. Previously the
+  string was treated as an error. When the last route entered bails out and nothing responds,
+  the request gets a 404 (not a 405). It only moves between routes at the matched trie node
+  (same path pattern), not to less specific patterns.
 
 Still open:
 
-4. **`next('route')`** and optional/regex params for Express parity.
+4. **Optional/regex params** for Express parity (and `next('route')` fallback to less specific
+   patterns, which needs a multi-node trie search).
 5. **TypeScript declarations** (`index.d.ts`) for editor support.
 6. **Trie backtracking bound:** pathological static/param route tables can hit
    `maxBacktracks` and 404 on a path that should match; consider precomputing
