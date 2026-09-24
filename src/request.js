@@ -1,26 +1,38 @@
+import http from 'node:http';
+
 /**
- * Augments Node's native http.IncomingMessage with lightweight helper properties
- * and async body parsing methods.
+ * Request helpers for BareWeb.
+ *
+ * All helpers live on BareRequest.prototype instead of being attached as fresh
+ * closures on every request: V8 keeps a single stable hidden class for requests,
+ * and derived values (query, cookies, ip, ...) are computed lazily on first access.
  */
 
 export const DEFAULT_BODY_LIMIT = 1024 * 1024; // 1 MB
 
+// Host header per RFC 3986: non-empty reg-name / IPv4 or bracketed IP literal, optional port.
+const HOST_RE = /^(?:[A-Za-z0-9\-._~!$&'()*+,;=%]+|\[[0-9A-Fa-f:.]+\])(?::(\d{0,5}))?$/;
+
 /**
  * Fast query string parser supporting arrays and duplicate keys.
- * @param {URLSearchParams} searchParams 
+ * @param {URLSearchParams} searchParams
  * @returns {Record<string, string|string[]>}
  */
 export function parseQuery(searchParams) {
   const query = {};
-  for (const [key, value] of searchParams.entries()) {
+  for (const [key, value] of searchParams) {
     const isArrayKey = key.endsWith('[]');
     const cleanKey = isArrayKey ? key.slice(0, -2) : key;
+    // Never let a query key reach Object.prototype
+    if (cleanKey === '__proto__') continue;
 
-    if (query[cleanKey] !== undefined) {
-      if (Array.isArray(query[cleanKey])) {
-        query[cleanKey].push(value);
+    // Own-property check: keys like "constructor" must not see Object.prototype
+    const existing = Object.hasOwn(query, cleanKey) ? query[cleanKey] : undefined;
+    if (existing !== undefined) {
+      if (Array.isArray(existing)) {
+        existing.push(value);
       } else {
-        query[cleanKey] = [query[cleanKey], value];
+        query[cleanKey] = [existing, value];
       }
     } else if (isArrayKey) {
       query[cleanKey] = [value];
@@ -31,199 +43,320 @@ export function parseQuery(searchParams) {
   return query;
 }
 
-export function decorateRequest(req, params = {}, parsedUrl) {
-  req.params = params;
-  req.path = parsedUrl.pathname;
-  req.query = parseQuery(parsedUrl.searchParams);
-  req.searchParams = parsedUrl.searchParams;
+/**
+ * Split a raw request target into pathname and search string without building a
+ * WHATWG URL on the hot path. Falls back to URL for targets that need
+ * normalization (dot segments, backslashes, absolute-form).
+ * @param {string} rawUrl
+ * @returns {{ pathname: string, search: string } | null} null when the target is malformed
+ */
+export function parseUrl(rawUrl) {
+  const qIdx = rawUrl.indexOf('?');
+  const rawPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
 
-  // Client IP address
-  req.ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket?.remoteAddress || '';
+  if (
+    rawPath.charCodeAt(0) === 47 /* / */ &&
+    rawPath.indexOf('/.') === -1 &&
+    rawPath.indexOf('\\') === -1
+  ) {
+    return { pathname: rawPath, search: qIdx === -1 ? '' : rawUrl.slice(qIdx) };
+  }
 
-  // Hostname & Protocol
-  req.hostname = parsedUrl.hostname;
-  req.protocol = req.headers['x-forwarded-proto'] || (req.socket?.encrypted ? 'https' : 'http');
-  req.secure = req.protocol === 'https';
+  try {
+    const url = new URL(rawUrl, 'http://localhost');
+    return { pathname: url.pathname, search: url.search };
+  } catch {
+    return null;
+  }
+}
 
-  // AJAX / XHR helper
-  req.xhr = (req.headers['x-requested-with'] || '').toLowerCase() === 'xmlhttprequest';
+/**
+ * @param {string|undefined} host
+ * @returns {boolean}
+ */
+export function isValidHost(host) {
+  // A missing/empty Host (HTTP/1.0 clients) is tolerated, as before
+  if (host === undefined || host === '') return true;
+  const match = HOST_RE.exec(host);
+  return match !== null && (!match[1] || Number(match[1]) <= 65535);
+}
 
-  // Header getter helper (Express-compatible)
-  req.get = function(headerName) {
-    return req.headers[headerName.toLowerCase()];
-  };
+function payloadTooLarge(limit) {
+  const err = new Error(`Payload Too Large: exceeded limit of ${limit} bytes`);
+  err.statusCode = 413;
+  err.status = 413;
+  return err;
+}
 
-  // Lazy cookie parsing
-  Object.defineProperty(req, 'cookies', {
-    get() {
-      if (req._parsedCookies) return req._parsedCookies;
-      const cookies = {};
-      const cookieHeader = req.headers.cookie;
-      if (cookieHeader) {
-        const pairs = cookieHeader.split(';');
-        for (let i = 0; i < pairs.length; i++) {
-          const pair = pairs[i];
-          const eqIdx = pair.indexOf('=');
-          if (eqIdx > 0) {
-            const key = pair.slice(0, eqIdx).trim();
-            const val = pair.slice(eqIdx + 1).trim();
-            try {
-              cookies[decodeURIComponent(key)] = decodeURIComponent(val);
-            } catch {
-              cookies[key] = val;
-            }
-          }
+export class BareRequest extends http.IncomingMessage {
+  /**
+   * Header getter helper (Express-compatible).
+   * @param {string} headerName
+   */
+  get(headerName) {
+    const name = headerName.toLowerCase();
+    if (name === 'referer' || name === 'referrer') {
+      return this.headers.referrer || this.headers.referer;
+    }
+    return this.headers[name];
+  }
+
+  get query() {
+    if (this._query === undefined) {
+      this._query = this._search && this._search.length > 1
+        ? parseQuery(new URLSearchParams(this._search))
+        : {};
+    }
+    return this._query;
+  }
+
+  set query(value) {
+    this._query = value;
+  }
+
+  get searchParams() {
+    if (this._searchParams === undefined) {
+      this._searchParams = new URLSearchParams(this._search || '');
+    }
+    return this._searchParams;
+  }
+
+  set searchParams(value) {
+    this._searchParams = value;
+  }
+
+  /** Whether X-Forwarded-* headers may be trusted (see the `trustProxy` app option). */
+  get _trustProxy() {
+    return Boolean(this.app && this.app.options && this.app.options.trustProxy);
+  }
+
+  get ip() {
+    if (this._trustProxy) {
+      const xff = this.headers['x-forwarded-for'];
+      if (xff) {
+        const comma = xff.indexOf(',');
+        return (comma === -1 ? xff : xff.slice(0, comma)).trim();
+      }
+    }
+    return this.socket?.remoteAddress || '';
+  }
+
+  get protocol() {
+    if (this._trustProxy) {
+      const proto = this.headers['x-forwarded-proto'];
+      if (proto) {
+        const comma = proto.indexOf(',');
+        return (comma === -1 ? proto : proto.slice(0, comma)).trim().toLowerCase();
+      }
+    }
+    return this.socket?.encrypted ? 'https' : 'http';
+  }
+
+  get secure() {
+    return this.protocol === 'https';
+  }
+
+  get hostname() {
+    let host = (this._trustProxy && this.headers['x-forwarded-host']) || this.headers.host;
+    if (!host) return '';
+    const comma = host.indexOf(',');
+    if (comma !== -1) host = host.slice(0, comma).trim();
+    // IPv6 literal: keep the brackets, strip the port after them
+    const offset = host.charCodeAt(0) === 91 /* [ */ ? host.indexOf(']') + 1 : 0;
+    const colon = host.indexOf(':', offset);
+    return (colon === -1 ? host : host.slice(0, colon)).toLowerCase();
+  }
+
+  get xhr() {
+    return (this.headers['x-requested-with'] || '').toLowerCase() === 'xmlhttprequest';
+  }
+
+  /** Lazily parsed cookies. */
+  get cookies() {
+    if (this._parsedCookies) return this._parsedCookies;
+    const cookies = {};
+    const cookieHeader = this.headers.cookie;
+    if (cookieHeader) {
+      const pairs = cookieHeader.split(';');
+      for (let i = 0; i < pairs.length; i++) {
+        const pair = pairs[i];
+        const eqIdx = pair.indexOf('=');
+        if (eqIdx <= 0) continue;
+        let key = pair.slice(0, eqIdx).trim();
+        if (key.indexOf('%') !== -1) {
+          try { key = decodeURIComponent(key); } catch { /* keep raw key */ }
+        }
+        let val = pair.slice(eqIdx + 1).trim();
+        if (val.charCodeAt(0) === 34 /* " */ && val.charCodeAt(val.length - 1) === 34) {
+          val = val.slice(1, -1);
+        }
+        // First occurrence wins (RFC 6265 ordering: most specific path first)
+        if (key === '__proto__' || Object.hasOwn(cookies, key)) continue;
+        try {
+          cookies[key] = val.indexOf('%') === -1 ? val : decodeURIComponent(val);
+        } catch {
+          cookies[key] = val;
         }
       }
-      req._parsedCookies = cookies;
-      return req._parsedCookies;
-    },
-    configurable: true
-  });
+    }
+    this._parsedCookies = cookies;
+    return cookies;
+  }
 
-  // Cached body storage
-  let _bodyBufferPromise = null;
-  let _bodyBuffer = null;
-  let _activeLimit = Infinity;
+  set cookies(value) {
+    this._parsedCookies = value;
+  }
 
   /**
    * Read raw request body as Buffer with a size limit.
-   * Emits HTTP 413 Payload Too Large error on overflow, even for cached reads.
-   * @param {number} limit Maximum allowed bytes
+   * Rejects with HTTP 413 on overflow, even for cached reads.
+   * @param {number} [limit]
    * @returns {Promise<Buffer>}
    */
-  req.buffer = function(limit = DEFAULT_BODY_LIMIT) {
-    if (_bodyBuffer !== null) {
-      if (_bodyBuffer.length > limit) {
-        const err = new Error(`Payload Too Large: exceeded limit of ${limit} bytes`);
-        err.statusCode = 413;
-        err.status = 413;
-        return Promise.reject(err);
-      }
-      return Promise.resolve(_bodyBuffer);
+  buffer(limit = DEFAULT_BODY_LIMIT) {
+    if (this._bodyBuffer) {
+      return this._bodyBuffer.length > limit
+        ? Promise.reject(payloadTooLarge(limit))
+        : Promise.resolve(this._bodyBuffer);
     }
 
-    if (_bodyBufferPromise !== null) {
-      if (limit < _activeLimit) {
-        _activeLimit = limit;
-      }
-      return _bodyBufferPromise.then((buf) => {
-        if (buf.length > limit) {
-          const err = new Error(`Payload Too Large: exceeded limit of ${limit} bytes`);
-          err.statusCode = 413;
-          err.status = 413;
-          throw err;
-        }
+    if (this._bodyPromise) {
+      if (limit < this._bodyLimit) this._bodyLimit = limit;
+      return this._bodyPromise.then((buf) => {
+        if (buf.length > limit) throw payloadTooLarge(limit);
         return buf;
       });
     }
 
-    _activeLimit = limit;
+    this._bodyLimit = limit;
 
-    _bodyBufferPromise = new Promise((resolve, reject) => {
+    // Reject early when the declared length already exceeds the limit.
+    const declared = this.headers['content-length'];
+    if (declared !== undefined && Number(declared) > limit) {
+      this.resume();
+      this._bodyPromise = Promise.reject(payloadTooLarge(limit));
+      return this._bodyPromise;
+    }
+
+    this._bodyPromise = new Promise((resolve, reject) => {
       const chunks = [];
       let totalSize = 0;
-      let exceeded = false;
+
+      const cleanup = () => {
+        this.removeListener('data', onData);
+        this.removeListener('end', onEnd);
+        this.removeListener('error', onError);
+      };
 
       const onData = (chunk) => {
-        if (exceeded) return;
         totalSize += chunk.length;
-        if (totalSize > _activeLimit) {
-          exceeded = true;
-          req.removeListener('data', onData);
-          req.removeListener('end', onEnd);
-          req.removeListener('error', onError);
-          req.resume(); // drain remaining stream so socket does not block
-          const err = new Error(`Payload Too Large: exceeded limit of ${_activeLimit} bytes`);
-          err.statusCode = 413;
-          err.status = 413;
-          reject(err);
+        if (totalSize > this._bodyLimit) {
+          cleanup();
+          this.resume(); // drain remaining stream so the socket does not stall
+          reject(payloadTooLarge(this._bodyLimit));
           return;
         }
         chunks.push(chunk);
       };
 
       const onEnd = () => {
-        if (!exceeded) {
-          _bodyBuffer = Buffer.concat(chunks);
-          resolve(_bodyBuffer);
-        }
+        cleanup();
+        this._bodyBuffer = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, totalSize);
+        resolve(this._bodyBuffer);
       };
 
       const onError = (err) => {
-        if (!exceeded) {
-          reject(err);
-        }
+        cleanup();
+        reject(err);
       };
 
-      req.on('data', onData);
-      req.on('end', onEnd);
-      req.on('error', onError);
+      this.on('data', onData);
+      this.on('end', onEnd);
+      this.on('error', onError);
     });
 
-    return _bodyBufferPromise;
-  };
+    return this._bodyPromise;
+  }
 
   /**
    * Read request body as a UTF-8 string.
-   * @param {number} limit 
+   * @param {number} [limit]
    * @returns {Promise<string>}
    */
-  req.text = async function(limit = DEFAULT_BODY_LIMIT) {
-    const buf = await req.buffer(limit);
+  async text(limit = DEFAULT_BODY_LIMIT) {
+    const buf = await this.buffer(limit);
     return buf.toString('utf-8');
-  };
+  }
 
   /**
    * Parse incoming JSON request body.
-   * Enforces requested limit even when body was previously cached.
-   * @param {number} limit 
+   * @param {number} [limit]
    * @returns {Promise<any>}
    */
-  req.json = async function(limit = DEFAULT_BODY_LIMIT) {
-    const buf = await req.buffer(limit);
-    if (req.body !== undefined && req._bodyFormat === 'json') {
-      return req.body;
+  async json(limit = DEFAULT_BODY_LIMIT) {
+    const buf = await this.buffer(limit);
+    if (this.body !== undefined && this._bodyFormat === 'json') {
+      return this.body;
     }
     const raw = buf.toString('utf-8');
     if (!raw || raw.trim() === '') {
-      req.body = {};
-      req._bodyFormat = 'json';
-      return req.body;
+      this.body = {};
+    } else {
+      try {
+        this.body = JSON.parse(raw);
+      } catch {
+        const parseError = new Error('Invalid JSON payload');
+        parseError.statusCode = 400;
+        throw parseError;
+      }
     }
-    try {
-      req.body = JSON.parse(raw);
-      req._bodyFormat = 'json';
-      return req.body;
-    } catch {
-      const parseError = new Error('Invalid JSON payload');
-      parseError.statusCode = 400;
-      throw parseError;
-    }
-  };
+    this._bodyFormat = 'json';
+    return this.body;
+  }
 
   /**
    * Parse incoming URL-encoded form body.
-   * Enforces requested limit even when body was previously cached.
-   * @param {number} limit 
+   * @param {number} [limit]
    * @returns {Promise<Record<string, string|string[]>>}
    */
-  req.urlencoded = async function(limit = DEFAULT_BODY_LIMIT) {
-    const buf = await req.buffer(limit);
-    if (req.body !== undefined && req._bodyFormat === 'urlencoded') {
-      return req.body;
+  async urlencoded(limit = DEFAULT_BODY_LIMIT) {
+    const buf = await this.buffer(limit);
+    if (this.body !== undefined && this._bodyFormat === 'urlencoded') {
+      return this.body;
     }
     const raw = buf.toString('utf-8');
-    if (!raw || raw.trim() === '') {
-      req.body = {};
-      req._bodyFormat = 'urlencoded';
-      return req.body;
-    }
-    const params = new URLSearchParams(raw);
-    req.body = parseQuery(params);
-    req._bodyFormat = 'urlencoded';
-    return req.body;
-  };
+    this.body = !raw || raw.trim() === '' ? {} : parseQuery(new URLSearchParams(raw));
+    this._bodyFormat = 'urlencoded';
+    return this.body;
+  }
+}
 
+// Derived getters stay assignable: writing one shadows it with an own property,
+// so middleware can override e.g. `req.ip` without a TypeError in strict mode.
+for (const name of ['ip', 'protocol', 'secure', 'hostname', 'xhr']) {
+  const descriptor = Object.getOwnPropertyDescriptor(BareRequest.prototype, name);
+  descriptor.set = function (value) {
+    Object.defineProperty(this, name, { value, writable: true, configurable: true, enumerable: true });
+  };
+  Object.defineProperty(BareRequest.prototype, name, descriptor);
+}
+
+/**
+ * Prepare a request for the BareWeb pipeline. Requests created by a BareWeb server
+ * already are BareRequests; foreign ones (e.g. `http.createServer(app.handle)`)
+ * get their prototype swapped once, like Express does.
+ * @param {http.IncomingMessage} req
+ * @param {Record<string, string>} [params]
+ * @param {{ pathname: string, search?: string }} [parsedUrl] URL or parseUrl() result
+ */
+export function decorateRequest(req, params = {}, parsedUrl) {
+  if (!(req instanceof BareRequest)) {
+    Object.setPrototypeOf(req, BareRequest.prototype);
+  }
+  const parsed = parsedUrl || parseUrl(req.url || '/') || { pathname: '/', search: '' };
+  req.params = params;
+  req.path = parsed.pathname;
+  req._search = parsed.search || '';
+  req.baseUrl = '';
   return req;
 }

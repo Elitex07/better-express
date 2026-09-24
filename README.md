@@ -10,7 +10,7 @@ BareWeb is designed to fulfill the core capabilities of standard web frameworks 
 
 - 🌲 **Radix Tree / Trie Router**: $O(K)$ path matching (where $K$ is path segment depth) for unambiguous routes, avoiding slow linear regex evaluation. Backtracking is bounded to protect against CPU exhaustion on ambiguous static/parameter siblings.
 - 🪶 **Zero Runtime Dependencies**: The core server framework runs natively on Node.js standard libraries (`node:http`, `node:fs`, `node:path`).
-- ⚡ **High Throughput & Low Latency**: Consistently higher throughput and lower tail latency than Express.js across typical micro-benchmarks.
+- ⚡ **High Throughput & Low Latency**: ~3.5× Express.js on simple routes and 7–9× on large route tables, 404s and JSON bodies, at 60–80 % of raw `node:http` (see [Benchmarks](#-benchmarks)).
 - 🔀 **Sub-Router Support**: Full modular routing with `Router`, sub-router prefix mounting (`app.use('/api', apiRouter)`), and router-scoped middleware.
 - 🔄 **Async Middleware Pipeline**: Modern middleware engine supporting `await next()` and Express-style `(req, res, next)` signatures with `req.baseUrl`.
 - 📦 **Built-in Async Parsers**: Native `await req.json()`, `await req.text()`, and `await req.urlencoded()` streaming parsers with safe HTTP 413 limit enforcement.
@@ -37,10 +37,13 @@ BareWeb /
 ├── test/
 │   ├── router.test.js    # Unit tests for route matching, parameters, and sub-routers
 │   ├── server.test.js    # Integration tests for server lifecycle, endpoints, and middleware
-│   └── features.test.js  # Integration tests for CORS, static serving, cookies, forms, limits
+│   ├── features.test.js  # Integration tests for CORS, static serving, cookies, forms, limits
+│   └── hardening.test.js # Proxy trust, HEAD fallback, param isolation, error/CORS/static hardening
 ├── benchmarks/
-│   └── compare.js        # Automated benchmark suite vs Express.js
-├── ROADMAP.md            # Strategic architecture roadmap & feature tiers
+│   ├── compare.js        # Benchmark runner (node:http vs Express vs BareWeb, optional Next.js)
+│   └── server.js         # Benchmark target servers, one child process each
+├── docs/
+│   └── AUDIT.md          # Code audit, performance comparison and roadmap
 └── package.json
 ```
 
@@ -122,6 +125,27 @@ api.get('/users', (req, res) => {
 app.use('/api/v2', api);
 ```
 
+### 4. Behind a Reverse Proxy
+
+`req.ip`, `req.protocol`, `req.secure` and `req.hostname` ignore `X-Forwarded-*` headers by
+default, because any client can send them. Enable `trustProxy` only when the app runs behind a
+proxy (nginx, a load balancer) that sets them:
+
+```javascript
+const app = createApp({ trustProxy: true });
+```
+
+### Notes
+
+- `HEAD` requests fall back to the matching `GET` route.
+- Mounting is live: routes and middleware added to a `Router` after `app.use('/x', router)` are
+  picked up, and run at the position where the router was mounted.
+- When a path exists under other methods, BareWeb answers `405 Method Not Allowed` with an
+  `Allow` header, and answers `OPTIONS` automatically (`createApp({ methodNotAllowed: false })`
+  restores plain 404s).
+- `serveStatic()` / `res.sendFile()` send `ETag` + `Last-Modified`, answer conditional requests
+  with `304`, and serve single byte ranges (`206`, `416` when unsatisfiable, `If-Range` aware).
+
 ---
 
 ## 🧪 Testing
@@ -134,16 +158,24 @@ npm test
 
 ---
 
-## 📊 Benchmarks (BareWeb vs Express.js)
+## 📊 Benchmarks
 
-Run the automated benchmark suite comparing BareWeb with Express.js under identical load using `autocannon`. The suite runs a warm-up phase for V8 JIT optimization followed by multiple trials to calculate mean throughput, standard deviation, and p99 latency:
+Each framework runs in its own child process and is hit by `autocannon` with identical routes
+(static, param, 5 middlewares, 500-route table, 404, JSON POST):
 
 ```bash
 npm run benchmark
+# knobs: BENCH_DURATION, BENCH_TRIALS, BENCH_CONNECTIONS, BENCH_WORKERS, BENCH_ONLY=bareweb,express
+# add a running Next.js app (GET /test, GET /users/[id] route handlers): NEXT_URL=http://127.0.0.1:3000
 ```
 
----
+Sample run (Node 22, 4 vCPU, 50 connections, req/s):
 
-## 🗺️ Roadmap & Future Architecture
+| Scenario | node:http | Express 4 | BareWeb | Next.js 16 |
+| --- | ---: | ---: | ---: | ---: |
+| Static route | ~60,400 | 12,677 | 41,855 | 1,527 |
+| Param route | ~65,300 | 11,733 | 40,775 | 1,397 |
+| 500-route table | ~59,400 | 5,281 | 47,212 | – |
+| POST JSON | ~34,400 | 3,980 | 28,305 | – |
 
-Looking to contribute or explore upcoming features? Check out our [Development Roadmap](file:///c:/Users/prate/Bareweb/BareWeb/ROADMAP.md) detailing TypeScript definitions, native Server-Sent Events (SSE), response compression, and Express middleware interoperability.
+Full methodology, findings and roadmap: [docs/AUDIT.md](docs/AUDIT.md).

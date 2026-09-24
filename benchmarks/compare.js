@@ -1,157 +1,137 @@
+/**
+ * Benchmark suite: BareWeb vs Express.js vs raw node:http (and optionally Next.js).
+ *
+ * Each server runs in its own child process, so autocannon never competes with the
+ * server under test for the same event loop.
+ *
+ * Env knobs:
+ *   BENCH_DURATION=5      seconds per trial
+ *   BENCH_TRIALS=3        trials per scenario (mean is reported)
+ *   BENCH_CONNECTIONS=50  concurrent connections
+ *   BENCH_WORKERS=0       autocannon worker threads (use 2+ on multi-core machines, otherwise
+ *                         the load generator, not the server, becomes the bottleneck)
+ *   BENCH_ONLY=bareweb,express   subset of frameworks
+ *   NEXT_URL=http://127.0.0.1:3000   an already running `next start` app that serves
+ *                                    GET /test and GET /users/[id] route handlers
+ */
+import { fork } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import autocannon from 'autocannon';
-import express from 'express';
-import { createApp } from '../src/index.js';
 
-const PORT_EXPRESS = 4001;
-const PORT_BAREWEB = 4002;
-const WARMUP_DURATION = 2; // seconds for JIT warm-up
-const DURATION = 5;        // seconds per trial run
-const TRIALS = 3;          // number of benchmark trials
-const CONNECTIONS = 50;
+const DURATION = Number(process.env.BENCH_DURATION || 5);
+const WARMUP_DURATION = 2;
+const TRIALS = Number(process.env.BENCH_TRIALS || 3);
+const CONNECTIONS = Number(process.env.BENCH_CONNECTIONS || 50);
+const WORKERS = Number(process.env.BENCH_WORKERS || 0);
+const SERVER_SCRIPT = fileURLToPath(new URL('./server.js', import.meta.url));
 
-async function startExpressServer() {
-  const app = express();
-  app.get('/test', (req, res) => {
-    res.json({ message: 'Hello from benchmark', timestamp: Date.now() });
-  });
-  app.get('/users/:id', (req, res) => {
-    res.json({ userId: req.params.id });
-  });
+const FRAMEWORKS = [
+  { name: 'node:http', key: 'node', port: 4000 },
+  { name: 'Express', key: 'express', port: 4001 },
+  { name: 'BareWeb', key: 'bareweb', port: 4002 }
+].filter((f) => !process.env.BENCH_ONLY || process.env.BENCH_ONLY.split(',').includes(f.key));
 
-  return new Promise((resolve) => {
-    const server = app.listen(PORT_EXPRESS, '127.0.0.1', () => resolve(server));
-  });
-}
-
-async function startBareWebServer() {
-  const app = createApp();
-  app.get('/test', (req, res) => {
-    res.json({ message: 'Hello from benchmark', timestamp: Date.now() });
-  });
-  app.get('/users/:id', (req, res) => {
-    res.json({ userId: req.params.id });
-  });
-
-  return new Promise((resolve) => {
-    const server = app.listen(PORT_BAREWEB, '127.0.0.1', () => resolve(server));
-  });
-}
-
-function runAutocannon(url, title, duration = DURATION) {
-  return new Promise((resolve, reject) => {
-    autocannon({
-      url,
-      connections: CONNECTIONS,
-      duration,
-      pipelining: 1
-    }, (err, result) => {
-      if (err) return reject(err);
-      resolve(result);
-    });
-  });
-}
-
-async function runBenchmarkWithTrials(url, title) {
-  // Warm-up run (not included in metrics)
-  process.stdout.write(`  Warming up ${title} (${WARMUP_DURATION}s)... `);
-  await runAutocannon(url, title, WARMUP_DURATION);
-  console.log('done.');
-
-  const results = [];
-  for (let trial = 1; trial <= TRIALS; trial++) {
-    process.stdout.write(`  Trial ${trial}/${TRIALS} for ${title}... `);
-    const res = await runAutocannon(url, title, DURATION);
-    results.push(res);
-    console.log(`${Math.round(res.requests.average)} req/s`);
+const SCENARIOS = [
+  { name: 'Static route', path: '/test' },
+  { name: 'Param route', path: '/users/123' },
+  { name: '5 middlewares', path: '/mw/test' },
+  { name: '500-route table', path: '/r499' },
+  { name: '404', path: '/nope' },
+  {
+    name: 'POST JSON',
+    path: '/echo',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'bench', tags: ['a', 'b', 'c'], nested: { n: 1 } })
   }
+];
 
-  const avgReqSec = results.reduce((acc, r) => acc + r.requests.average, 0) / results.length;
-  const avgLatency = results.reduce((acc, r) => acc + r.latency.average, 0) / results.length;
-  const avgP99 = results.reduce((acc, r) => acc + r.latency.p99, 0) / results.length;
+function startServer(key, port) {
+  return new Promise((resolve, reject) => {
+    const child = fork(SERVER_SCRIPT, [key, String(port)], { stdio: 'inherit' });
+    child.once('message', (msg) => msg === 'ready' && resolve(child));
+    child.once('error', reject);
+    child.once('exit', (code) => reject(new Error(`${key} server exited with code ${code}`)));
+  });
+}
 
-  // Compute standard deviation of throughput
-  const variance = results.reduce((acc, r) => acc + Math.pow(r.requests.average - avgReqSec, 2), 0) / results.length;
-  const stdDev = Math.sqrt(variance);
+function run(opts, duration) {
+  return new Promise((resolve, reject) => {
+    const workers = WORKERS > 0 ? { workers: WORKERS } : {};
+    autocannon({ connections: CONNECTIONS, pipelining: 1, duration, ...workers, ...opts }, (err, result) =>
+      err ? reject(err) : resolve(result)
+    );
+  });
+}
 
+async function measure(baseUrl, scenario) {
+  const opts = {
+    url: baseUrl + scenario.path,
+    method: scenario.method || 'GET',
+    headers: scenario.headers,
+    body: scenario.body
+  };
+  await run(opts, WARMUP_DURATION);
+  const results = [];
+  for (let i = 0; i < TRIALS; i++) results.push(await run(opts, DURATION));
+  const mean = (fn) => results.reduce((acc, r) => acc + fn(r), 0) / results.length;
   return {
-    avgReqSec: Math.round(avgReqSec),
-    stdDev: Math.round(stdDev),
-    avgLatency: Number(avgLatency.toFixed(2)),
-    avgP99: Number(avgP99.toFixed(2))
+    reqSec: Math.round(mean((r) => r.requests.average)),
+    p99: Number(mean((r) => r.latency.p99).toFixed(2)),
+    errors: results.reduce((acc, r) => acc + r.errors + r.non2xx, 0)
   };
 }
 
 async function main() {
-  console.log('====================================================');
-  console.log('🔥 BareWeb vs Express.js Benchmark Suite');
-  console.log(`Trials: ${TRIALS} x ${DURATION}s | Warmup: ${WARMUP_DURATION}s | Concurrency: ${CONNECTIONS}`);
-  console.log('====================================================\n');
+  console.log(`Trials: ${TRIALS} x ${DURATION}s | Warmup: ${WARMUP_DURATION}s | Connections: ${CONNECTIONS} | Workers: ${WORKERS}\n`);
 
-  const expressServer = await startExpressServer();
-  const bareWebServer = await startBareWebServer();
-
+  const targets = [];
+  const rows = [];
   try {
-    // 1. Static Route
-    console.log('--- 1. Static Route (/test) ---');
-    const expressStatic = await runBenchmarkWithTrials(`http://127.0.0.1:${PORT_EXPRESS}/test`, 'Express');
-    const bareWebStatic = await runBenchmarkWithTrials(`http://127.0.0.1:${PORT_BAREWEB}/test`, 'BareWeb');
+    // Inside try: if a later server fails to start, the earlier ones are still killed
+    for (const fw of FRAMEWORKS) {
+      targets.push({ ...fw, url: `http://127.0.0.1:${fw.port}`, child: await startServer(fw.key, fw.port) });
+    }
+    if (process.env.NEXT_URL) {
+      targets.push({ name: 'Next.js', url: process.env.NEXT_URL, only: ['/test', '/users/123'] });
+    }
 
-    // 2. Parameterized Route
-    console.log('\n--- 2. Parameterized Route (/users/123) ---');
-    const expressParam = await runBenchmarkWithTrials(`http://127.0.0.1:${PORT_EXPRESS}/users/123`, 'Express');
-    const bareWebParam = await runBenchmarkWithTrials(`http://127.0.0.1:${PORT_BAREWEB}/users/123`, 'BareWeb');
-
-    console.log('\n====================================================');
-    console.log('📊 Benchmark Results Summary (Multi-Trial Means)');
-    console.log('====================================================\n');
-
-    const summaryTable = [
-      {
-        Route: '/test (Static)',
-        Framework: 'Express.js',
-        'Req/Sec (Mean)': expressStatic.avgReqSec,
-        'Std Dev': `±${expressStatic.stdDev}`,
-        'Avg Latency (ms)': expressStatic.avgLatency,
-        'p99 Latency (ms)': expressStatic.avgP99
-      },
-      {
-        Route: '/test (Static)',
-        Framework: 'BareWeb ⚡',
-        'Req/Sec (Mean)': bareWebStatic.avgReqSec,
-        'Std Dev': `±${bareWebStatic.stdDev}`,
-        'Avg Latency (ms)': bareWebStatic.avgLatency,
-        'p99 Latency (ms)': bareWebStatic.avgP99
-      },
-      {
-        Route: '/users/:id (Param)',
-        Framework: 'Express.js',
-        'Req/Sec (Mean)': expressParam.avgReqSec,
-        'Std Dev': `±${expressParam.stdDev}`,
-        'Avg Latency (ms)': expressParam.avgLatency,
-        'p99 Latency (ms)': expressParam.avgP99
-      },
-      {
-        Route: '/users/:id (Param)',
-        Framework: 'BareWeb ⚡',
-        'Req/Sec (Mean)': bareWebParam.avgReqSec,
-        'Std Dev': `±${bareWebParam.stdDev}`,
-        'Avg Latency (ms)': bareWebParam.avgLatency,
-        'p99 Latency (ms)': bareWebParam.avgP99
+    for (const scenario of SCENARIOS) {
+      const row = { Scenario: scenario.name };
+      for (const target of targets) {
+        if (target.only && !target.only.includes(scenario.path)) {
+          row[target.name] = '-';
+          continue;
+        }
+        process.stdout.write(`  ${scenario.name} @ ${target.name}... `);
+        const r = await measure(target.url, scenario);
+        // 404 scenario is expected to be non-2xx; ignore those counts there.
+        const errNote = r.errors && scenario.path !== '/nope' ? ` (${r.errors} errors)` : '';
+        console.log(`${r.reqSec} req/s, p99 ${r.p99}ms${errNote}`);
+        row[target.name] = `${r.reqSec} (p99 ${r.p99}ms)`;
+        target[scenario.name] = r.reqSec;
       }
-    ];
-
-    console.table(summaryTable);
-
-    const speedupStatic = (((bareWebStatic.avgReqSec / expressStatic.avgReqSec) - 1) * 100).toFixed(1);
-    const speedupParam = (((bareWebParam.avgReqSec / expressParam.avgReqSec) - 1) * 100).toFixed(1);
-
-    console.log('\n🚀 Performance Delta:');
-    console.log(`- Static Route: BareWeb is ${speedupStatic >= 0 ? `+${speedupStatic}% faster` : `${speedupStatic}%`}`);
-    console.log(`- Parameterized Route: BareWeb is ${speedupParam >= 0 ? `+${speedupParam}% faster` : `${speedupParam}%`}`);
+      rows.push(row);
+    }
   } finally {
-    expressServer.close();
-    bareWebServer.close();
+    for (const t of targets) t.child?.kill();
+  }
+
+  console.log('\nRequests/sec (mean), p99 latency');
+  console.table(rows);
+
+  const bare = targets.find((t) => t.key === 'bareweb');
+  const exp = targets.find((t) => t.key === 'express');
+  if (bare && exp) {
+    console.log('\nBareWeb vs Express:');
+    for (const s of SCENARIOS) {
+      const delta = ((bare[s.name] / exp[s.name] - 1) * 100).toFixed(1);
+      console.log(`  ${s.name.padEnd(16)} ${delta >= 0 ? '+' : ''}${delta}%`);
+    }
   }
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
