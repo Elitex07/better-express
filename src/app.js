@@ -12,11 +12,18 @@ export class BareWeb {
    *   for req.ip, req.protocol and req.hostname. Enable only behind a reverse proxy.
    * @param {boolean} [options.methodNotAllowed=true] Answer 405 (with an Allow header) when the
    *   path exists under other methods, and answer OPTIONS automatically. `false` sends 404 instead.
+   * @param {number} [options.keepAliveTimeout] ms an idle keep-alive socket stays open
+   *   (Node default 5000). Set above your load balancer's idle timeout.
+   * @param {number} [options.headersTimeout] ms allowed to receive the full request headers
+   *   (Node default 60000).
+   * @param {number} [options.requestTimeout] ms allowed to receive the full request
+   *   (Node default 300000). `0` disables it.
    */
   constructor(options = {}) {
     this.options = options;
     this.router = new Router(options);
     this.server = null;
+    this._closing = false;
     this.middleware = {
       use: (...args) => this.use(...args),
       get entries() {
@@ -159,6 +166,10 @@ export class BareWeb {
       { IncomingMessage: BareRequest, ServerResponse: BareResponse },
       this.handle
     );
+    for (const key of ['keepAliveTimeout', 'headersTimeout', 'requestTimeout']) {
+      if (this.options[key] !== undefined) this.server[key] = this.options[key];
+    }
+    this._closing = false;
     // Without a host, Node listens on :: (IPv4 + IPv6) when available
     return host === undefined
       ? this.server.listen(port, cb)
@@ -166,15 +177,56 @@ export class BareWeb {
   }
 
   /**
-   * Close the running HTTP server.
-   * @param {Function} [cb] 
+   * Gracefully close the running HTTP server: stop accepting connections, drop idle
+   * keep-alive sockets, and let in-flight requests finish (their responses are sent with
+   * `Connection: close`). After `timeout` ms any remaining connections are destroyed.
+   *
+   * With a callback, errors (e.g. server not running) go to it and the promise resolves;
+   * without one, the promise rejects.
+   * @param {{ timeout?: number }|Function} [optionsOrCb]
+   * @param {Function} [cb]
+   * @returns {Promise<void>}
    */
-  close(cb) {
-    if (this.server) {
-      this.server.close(cb);
-    } else if (cb) {
-      cb();
+  close(optionsOrCb, cb) {
+    let options = {};
+    if (typeof optionsOrCb === 'function') {
+      cb = optionsOrCb;
+    } else if (optionsOrCb) {
+      options = optionsOrCb;
     }
+
+    const server = this.server;
+    if (!server) {
+      if (cb) cb();
+      return Promise.resolve();
+    }
+
+    this._closing = true;
+    return new Promise((resolve, reject) => {
+      let timer;
+      server.close((err) => {
+        clearTimeout(timer);
+        if (this.server === server) {
+          this.server = null;
+          this._closing = false;
+        }
+        if (cb) {
+          cb(err);
+          resolve();
+        } else if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+      // Node >= 19 does this inside close(); older versions keep idle sockets open
+      if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+
+      if (options.timeout !== undefined && typeof server.closeAllConnections === 'function') {
+        timer = setTimeout(() => server.closeAllConnections(), options.timeout);
+        timer.unref();
+      }
+    });
   }
 }
 

@@ -135,6 +135,27 @@ proxy (nginx, a load balancer) that sets them:
 const app = createApp({ trustProxy: true });
 ```
 
+### 5. Timeouts & Graceful Shutdown
+
+`keepAliveTimeout`, `headersTimeout` and `requestTimeout` (ms) are applied to the underlying
+`http.Server`; unset ones keep Node's defaults. Behind a load balancer, set `keepAliveTimeout`
+above the balancer's idle timeout to avoid sporadic 502s.
+
+`app.close()` stops accepting connections, closes idle keep-alive sockets right away, and lets
+in-flight requests finish (their responses carry `Connection: close`). Pass `timeout` to
+destroy whatever is still open after that many ms. It returns a promise and also accepts a
+callback.
+
+```javascript
+const app = createApp({ keepAliveTimeout: 65_000, headersTimeout: 66_000 });
+app.listen(3000);
+
+process.on('SIGTERM', async () => {
+  await app.close({ timeout: 10_000 });
+  process.exit(0);
+});
+```
+
 ### Notes
 
 - `HEAD` requests fall back to the matching `GET` route.

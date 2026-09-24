@@ -132,6 +132,16 @@ export function parseRange(header, size) {
  */
 export class BareResponse extends http.ServerResponse {
   /**
+   * Node routes implicit headers (plain `end()`/`write()`) through here as well, so this
+   * is the last point to drop keep-alive for requests still in flight when `app.close()`
+   * started: the socket is then closed once the response finishes.
+   */
+  writeHead() {
+    if (this.req?.app?._closing === true) this.shouldKeepAlive = false;
+    return super.writeHead.apply(this, arguments);
+  }
+
+  /**
    * Set HTTP status code (chainable).
    * @param {number} code
    */

@@ -135,15 +135,17 @@ _Done in the follow-up change:_
   `If-Modified-Since` → 304, single `bytes=` ranges → 206, 416 with `Content-Range: bytes */size`,
   `If-Range`. Multi-range requests get the full file (allowed by RFC 9110). Precompressed
   `.br/.gz` variants remain open.
+- ~~**Server lifecycle.**~~ `keepAliveTimeout` / `headersTimeout` / `requestTimeout` app
+  options are applied to the server. `close()` is graceful: it closes idle keep-alive sockets,
+  lets in-flight requests finish with `Connection: close` (checked in `BareResponse.writeHead`),
+  optionally force-closes after `{ timeout }`, and returns a promise.
 
 Still open:
 
 4. **`next('route')`** and optional/regex params for Express parity.
 5. **TypeScript declarations** (`index.d.ts`) for editor support.
-6. **Server lifecycle:** expose `keepAliveTimeout`/`headersTimeout`/`requestTimeout`, and a
-   graceful `close()` that calls `server.closeIdleConnections()`.
-7. **Trie backtracking bound:** pathological static/param route tables can hit
+6. **Trie backtracking bound:** pathological static/param route tables can hit
    `maxBacktracks` and 404 on a path that should match; consider precomputing
    static-vs-param conflicts at insert time instead.
-8. **CI:** run `npm test` on Node 18/20/22 in GitHub Actions; publish benchmark results
+7. **CI:** run `npm test` on Node 18/20/22 in GitHub Actions; publish benchmark results
    from a dedicated machine rather than a shared VM.
