@@ -3,9 +3,13 @@
   "version": "1.0.0",
   "description": "A high-performance, optimized, and lightweight web server framework for Node.js",
   "main": "src/index.js",
+  "types": "src/index.d.ts",
   "type": "module",
   "exports": {
-    ".": "./src/index.js"
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
   },
   "files": [
     "src",
@@ -15,7 +19,8 @@
   "scripts": {
     "start": "node examples/basic-server.js",
     "test": "node --test test/*.test.js",
-    "benchmark": "node benchmarks/compare.js"
+    "benchmark": "node benchmarks/compare.js",
+    "typecheck": "tsc -p test/types"
   },
   "keywords": [
     "web",
@@ -29,8 +34,10 @@
   "author": "BareWeb Team",
   "license": "MIT",
   "devDependencies": {
+    "@types/node": "^22.20.4",
     "autocannon": "^8.0.0",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=18"

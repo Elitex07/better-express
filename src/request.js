@@ -13,6 +13,43 @@ export const DEFAULT_BODY_LIMIT = 1024 * 1024; // 1 MB
 // Host header per RFC 3986: non-empty reg-name / IPv4 or bracketed IP literal, optional port.
 const HOST_RE = /^(?:[A-Za-z0-9\-._~!$&'()*+,;=%]+|\[[0-9A-Fa-f:.]+\])(?::(\d{0,5}))?$/;
 
+const LOOPBACK = ['127.0.0.1', '::1'];
+
+/**
+ * Canonical form for comparing peer addresses: lower-case, and IPv4-mapped IPv6
+ * ("::ffff:10.0.0.2", what a dual-stack listener reports for IPv4 peers) as plain IPv4.
+ * @param {string} addr
+ */
+function normalizeAddress(addr) {
+  const lower = String(addr).trim().toLowerCase();
+  return lower.startsWith('::ffff:') && lower.includes('.', 7) ? lower.slice(7) : lower;
+}
+
+/**
+ * Normalise the `trustProxy` option into a predicate over the direct peer's address.
+ * - false/undefined: never trust X-Forwarded-* (default; safe when exposed directly)
+ * - true: always trust
+ * - function(remoteAddress): custom decision
+ * - string (comma-separated) | string[]: trust these peer addresses; 'loopback' covers
+ *   127.0.0.1 and ::1. IPv4-mapped IPv6 forms (::ffff:10.0.0.2) match their IPv4 entry.
+ * @param {boolean|Function|string|string[]} [trustProxy]
+ * @returns {(remoteAddress: string) => boolean}
+ */
+export function compileTrustProxy(trustProxy) {
+  if (trustProxy === true) return () => true;
+  if (typeof trustProxy === 'function') return (addr) => Boolean(trustProxy(addr));
+  if (typeof trustProxy === 'string' || Array.isArray(trustProxy)) {
+    const list = new Set(
+      (Array.isArray(trustProxy) ? trustProxy : trustProxy.split(','))
+        .map(normalizeAddress)
+        .filter(Boolean)
+    );
+    if (list.delete('loopback')) for (const addr of LOOPBACK) list.add(addr);
+    return (addr) => list.has(normalizeAddress(addr));
+  }
+  return () => false;
+}
+
 /**
  * Fast query string parser supporting arrays and duplicate keys.
  * @param {URLSearchParams} searchParams
@@ -51,6 +88,9 @@ export function parseQuery(searchParams) {
  * @returns {{ pathname: string, search: string } | null} null when the target is malformed
  */
 export function parseUrl(rawUrl) {
+  // Browsers never send fragments, but raw clients can; they are not part of the target
+  const hashIdx = rawUrl.indexOf('#');
+  if (hashIdx !== -1) rawUrl = rawUrl.slice(0, hashIdx);
   const qIdx = rawUrl.indexOf('?');
   const rawPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
 
@@ -114,6 +154,12 @@ export class BareRequest extends http.IncomingMessage {
     this._query = value;
   }
 
+  /** Raw query string without the leading "?" ('' when absent). */
+  get search() {
+    const search = this._search;
+    return search ? search.slice(1) : '';
+  }
+
   get searchParams() {
     if (this._searchParams === undefined) {
       this._searchParams = new URLSearchParams(this._search || '');
@@ -127,7 +173,9 @@ export class BareRequest extends http.IncomingMessage {
 
   /** Whether X-Forwarded-* headers may be trusted (see the `trustProxy` app option). */
   get _trustProxy() {
-    return Boolean(this.app && this.app.options && this.app.options.trustProxy);
+    const app = this.app;
+    return app !== undefined && typeof app._trustsProxy === 'function' &&
+      app._trustsProxy(this.socket?.remoteAddress || '');
   }
 
   get ip() {

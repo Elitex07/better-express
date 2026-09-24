@@ -1,0 +1,55 @@
+name: Benchmark
+
+# Manual only. GitHub-hosted runners are shared VMs with noisy neighbours, so absolute
+# numbers vary between runs; compare frameworks within one run, not across runs.
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds per trial
+        default: '5'
+      trials:
+        description: Trials per scenario
+        default: '3'
+      only:
+        description: Comma-separated subset of node,express,bareweb (empty = all)
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Run benchmark
+        env:
+          BENCH_DURATION: ${{ inputs.duration }}
+          BENCH_TRIALS: ${{ inputs.trials }}
+          BENCH_ONLY: ${{ inputs.only }}
+        run: |
+          {
+            echo "Runner: $(nproc) vCPU, $(node --version), commit ${GITHUB_SHA::7}"
+            echo
+            npm run --silent benchmark
+          } 2>&1 | tee benchmark.txt
+      - name: Add results to the job summary
+        run: |
+          {
+            echo '## Benchmark results'
+            echo
+            echo '```'
+            cat benchmark.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-${{ github.sha }}
+          path: benchmark.txt

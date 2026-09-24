@@ -33,6 +33,7 @@ export const MIME_TYPES = {
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const SAME_SITE = { strict: 'Strict', lax: 'Lax', none: 'None' };
+const PRIORITY = { low: 'Low', medium: 'Medium', high: 'High' };
 
 /**
  * Validator for a file: size, mtime and ctime (µs) in hex.
@@ -131,6 +132,16 @@ export function parseRange(header, size) {
  * keeps response objects monomorphic and avoids ~15 closure allocations per hit.
  */
 export class BareResponse extends http.ServerResponse {
+  /**
+   * Node routes implicit headers (plain `end()`/`write()`) through here as well, so this
+   * is the last point to drop keep-alive for requests still in flight when `app.close()`
+   * started: the socket is then closed once the response finishes.
+   */
+  writeHead() {
+    if (this.req?.app?._closing === true) this.shouldKeepAlive = false;
+    return super.writeHead.apply(this, arguments);
+  }
+
   /**
    * Set HTTP status code (chainable).
    * @param {number} code
@@ -276,7 +287,20 @@ export class BareResponse extends http.ServerResponse {
     if (options.sameSite) {
       const sameSite = options.sameSite === true ? 'Strict' : SAME_SITE[String(options.sameSite).toLowerCase()];
       if (!sameSite) throw new TypeError(`Invalid sameSite option: ${options.sameSite}`);
+      // Browsers drop SameSite=None cookies without Secure; fail loudly instead
+      if (sameSite === 'None' && !options.secure) {
+        throw new TypeError('Cookies with sameSite: "none" must also set secure: true');
+      }
       cookieStr += `; SameSite=${sameSite}`;
+    }
+    if (options.priority) {
+      const priority = PRIORITY[String(options.priority).toLowerCase()];
+      if (!priority) throw new TypeError(`Invalid priority option: ${options.priority} (expected low, medium or high)`);
+      cookieStr += `; Priority=${priority}`;
+    }
+    if (options.partitioned) {
+      if (!options.secure) throw new TypeError('Partitioned cookies (CHIPS) must also set secure: true');
+      cookieStr += '; Partitioned';
     }
 
     const prev = this.getHeader('Set-Cookie');
@@ -300,8 +324,24 @@ export class BareResponse extends http.ServerResponse {
   }
 
   /**
-   * Redirect to URL with optional status (default 302).
-   * Accepts both `redirect(url, status)` and Express-style `redirect(status, url)`.
+   * Set the Location header (chainable). "back" resolves to the Referer, or "/".
+   * @param {string} url
+   */
+  location(url) {
+    let target = url;
+    if (url === 'back') {
+      const headers = this.req ? this.req.headers : {};
+      target = headers.referer || headers.referrer || '/';
+    }
+    // Encode what must be encoded, without double-encoding existing %XX escapes
+    this.setHeader('Location', encodeURI(target).replace(/%25([0-9A-Fa-f]{2})/g, '%$1'));
+    return this;
+  }
+
+  /**
+   * Redirect to URL with optional status (default 302), with a short text body for
+   * non-browser clients. Accepts both `redirect(url, status)` and Express-style
+   * `redirect(status, url)`; "back" redirects to the Referer.
    * @param {string|number} urlOrStatus
    * @param {number|string} [statusOrUrl]
    */
@@ -312,10 +352,16 @@ export class BareResponse extends http.ServerResponse {
       status = urlOrStatus;
       url = statusOrUrl;
     }
+    if (typeof url !== 'string') {
+      throw new TypeError('res.redirect() requires a URL string');
+    }
+    this.location(url);
     this.statusCode = status;
-    this.setHeader('Location', encodeURI(url).replace(/%25([0-9A-Fa-f]{2})/g, '%$1'));
-    this.setHeader('Content-Length', 0);
-    this.end();
+    const body = `${http.STATUS_CODES[status] || 'Redirecting'}. Redirecting to ${this.getHeader('Location')}`;
+    this.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    this.setHeader('Content-Length', Buffer.byteLength(body));
+    // Node omits the body for HEAD responses
+    this.end(body);
     return this;
   }
 
@@ -323,7 +369,8 @@ export class BareResponse extends http.ServerResponse {
    * Stream a file to the response with proper Content-Type.
    * Sends ETag/Last-Modified, answers conditional requests with 304 and single byte
    * ranges with 206 (416 when unsatisfiable). Options: `etag`, `lastModified`,
-   * `acceptRanges` (all default true), `cacheControl`, `onError`.
+   * `acceptRanges` (all default true), `cacheControl`, `headers` (extra response headers,
+   * set once the file is found; a Content-Type here wins over the extension), `onError`.
    * Resolves after the response finishes (or after a 404/500 was sent), and never rejects.
    * @param {string} filePath
    * @param {object|Function} [optionsOrCallback]
@@ -368,6 +415,14 @@ export class BareResponse extends http.ServerResponse {
         if (etag) this.setHeader('ETag', etag);
         if (lastModified) this.setHeader('Last-Modified', lastModified);
         if (options.cacheControl) this.setHeader('Cache-Control', options.cacheControl);
+        // Extra headers only once the file is known to exist, so 404/500 fallbacks stay clean
+        let typeFromOptions = false;
+        if (options.headers) {
+          for (const name of Object.keys(options.headers)) {
+            this.setHeader(name, options.headers[name]);
+            if (name.toLowerCase() === 'content-type') typeFromOptions = true;
+          }
+        }
 
         if (cacheable && isNotModified(req.headers, etag, lastModified ? stats.mtimeMs : null)) {
           this.statusCode = 304;
@@ -377,7 +432,7 @@ export class BareResponse extends http.ServerResponse {
         }
 
         const ext = path.extname(filePath).toLowerCase();
-        this.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
+        if (!typeFromOptions) this.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
 
         let range = null;
         if (options.acceptRanges !== false) {

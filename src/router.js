@@ -20,10 +20,10 @@ function normalizePrefix(prefix) {
 export class Router {
   /**
    * @param {object} [options]
-   * @param {number} [options.maxBacktracks=500] Maximum backtrack steps for Trie route resolution
+   * @param {number} [options.maxBacktracks] Deprecated and ignored: route search needs no cap
    */
   constructor(options = {}) {
-    this.options = options;
+    this.settings = options;
 
     /**
      * This router's own registrations, in order. Mounted routers appear as a single
@@ -148,7 +148,7 @@ export class Router {
 
     let ownTrie = this._ownTrees.get(upperMethod);
     if (!ownTrie) {
-      ownTrie = new Trie(this.options);
+      ownTrie = new Trie(this.settings);
       this._ownTrees.set(upperMethod, ownTrie);
     }
     ownTrie.insert(path, flatHandlers);
@@ -185,9 +185,9 @@ export class Router {
    */
   _compile() {
     const trees = new Map();
-    for (const method of HTTP_METHODS) trees.set(method, new Trie(this.options));
+    for (const method of HTTP_METHODS) trees.set(method, new Trie(this.settings));
     // Every route regardless of method: lets allowedMethods() rule out a path in one lookup
-    const anyMethod = new Trie(this.options);
+    const anyMethod = new Trie(this.settings);
     const middlewareEntries = [];
     const routes = [];
     const middlewares = [];
@@ -210,7 +210,7 @@ export class Router {
           const path = joinPaths(base, entry.path);
           let trie = trees.get(entry.method);
           if (!trie) {
-            trie = new Trie(this.options);
+            trie = new Trie(this.settings);
             trees.set(entry.method, trie);
           }
           const routeEntry = { type: 'route', id: ++seq, method: entry.method, path, handlers: entry.handlers };
@@ -271,12 +271,13 @@ export class Router {
           pathname === mw.prefix ||
           pathname.startsWith(mw.prefixSlash)
         ) {
-          (mw.isErrorHandler ? errorHandlers : pipeline).push({ prefix: mw.prefix, handler: mw.handler });
+          (mw.isErrorHandler ? errorHandlers : pipeline).push({ prefix: mw.prefix, handler: mw.handler, params: undefined, route: 0 });
         }
       } else {
         r++;
         for (const handler of route.handlers) {
-          (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler, params: route.params });
+          // `route` groups a route's handlers so next('route') can skip the rest of them
+          (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler, params: route.params, route: route.routeEntry.id });
         }
       }
     }
@@ -287,6 +288,45 @@ export class Router {
       pipeline,
       errorHandlers
     };
+  }
+
+  /**
+   * Next-best route match after every route at the previously matched trie nodes bailed
+   * out with next('route'), e.g. `/users/me` -> `/users/:id`. Only called on that path,
+   * so normal requests never pay for it. Middlewares are not included: they already ran.
+   * @param {string} method
+   * @param {string} pathname
+   * @param {Set<object>} skip Trie nodes already used; the new match's node is added
+   * @returns {{ params: Record<string, string>, pipeline: object[], errorHandlers: object[] } | null}
+   */
+  resolveNext(method, pathname, skip) {
+    if (this._dirty) this._compile();
+    const upperMethod = method ? method.toUpperCase() : 'GET';
+    const find = () => {
+      const trie = this._trees.get(upperMethod);
+      let match = trie ? trie.search(pathname, skip) : null;
+      if (!match && upperMethod === 'HEAD') match = this._trees.get('GET').search(pathname, skip);
+      return match;
+    };
+
+    // The first call starts from the node resolve() matched
+    if (skip.size === 0) {
+      const first = find();
+      if (!first) return null;
+      skip.add(first.node);
+    }
+    const match = find();
+    if (!match) return null;
+    skip.add(match.node);
+
+    const pipeline = [];
+    const errorHandlers = [];
+    for (const route of match.matches) {
+      for (const handler of route.handlers) {
+        (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler, params: route.params, route: route.routeEntry.id });
+      }
+    }
+    return { params: match.params, pipeline, errorHandlers };
   }
 
   /**

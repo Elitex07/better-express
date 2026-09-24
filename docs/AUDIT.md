@@ -10,7 +10,7 @@ BareWeb is a zero-dependency, Express-style HTTP framework on top of `node:http`
 | --- | --- | --- |
 | App | `src/app.js` | `createApp()`, `use()`, method helpers, `handle(req, res)` dispatcher, `listen()` |
 | Router | `src/router.js` | Keeps a registration-ordered `stack` of middlewares + routes, one `Trie` per HTTP method, sub-router mounting |
-| Trie | `src/trie.js` | Segment trie: static > `:param` > `*wildcard`, bounded backtracking |
+| Trie | `src/trie.js` | Segment trie: static > `:param` > `*wildcard`, backtracking visits each node at most once |
 | Request | `src/request.js` | `req.params/query/cookies/ip/...`, streaming body readers with size limits |
 | Response | `src/response.js` | `res.status/json/send/html/redirect/cookie/sendFile` |
 | Middleware | `src/middleware.js` | Pipeline runner, default error handler, `cors`, `serveStatic`, `json`, `urlencoded` |
@@ -135,15 +135,67 @@ _Done in the follow-up change:_
   `If-Modified-Since` → 304, single `bytes=` ranges → 206, 416 with `Content-Range: bytes */size`,
   `If-Range`. Multi-range requests get the full file (allowed by RFC 9110). Precompressed
   `.br/.gz` variants remain open.
+- ~~**Server lifecycle.**~~ `keepAliveTimeout` / `headersTimeout` / `requestTimeout` app
+  options are applied to the server. `close()` is graceful: it closes idle keep-alive sockets,
+  lets in-flight requests finish with `Connection: close` (checked in `BareResponse.writeHead`),
+  optionally force-closes after `{ timeout }`, and returns a promise.
+- ~~**`next('route')`.**~~ Route handlers in the resolved pipeline carry their route id;
+  `next('route')` skips to the first item of another route or middleware. Previously the
+  string was treated as an error. When the last route entered bails out and nothing responds,
+  the request gets a 404 (not a 405). It only moves between routes at the matched trie node
+  (same path pattern), not to less specific patterns.
+- ~~**TypeScript declarations.**~~ Hand-written `src/index.d.ts`, wired through `types` and the
+  `exports` `types` condition, with `req.params` inferred from route path literals.
+  `npm run typecheck` compiles `test/types/usage.ts` (including `@ts-expect-error` negative
+  cases). Inline 4-argument error handlers need annotations, as with Express's types.
+- ~~**Trie backtracking bound.**~~ The `maxBacktracks` cap is gone (the option is accepted and
+  ignored). The trie is a tree and each node sits at a fixed depth, so a search visits every
+  node at most once: a miss is bounded by the trie size (≈6 ms for an adversarial
+  65,536-route table), never exponential in the request path. With the cap, a valid route
+  behind more than 500 failed static branches returned 404; a regression test covers that.
+  (The cap had been removed once before, in `35e10fb`, and came back with the `f489113` rewrite.)
+- ~~**`app.options()` / `router.options()`.**~~ Both threw "options is not a function": the
+  constructor's `this.options = options` shadowed the route method. Constructor options now
+  live on **`app.settings` / `router.settings`** (breaking for code that read `app.options`).
+  This was also fixed once before (`7fcbc2c`) and regressed in `f489113`.
+- ~~**CI.**~~ `.github/workflows/ci.yml`: `npm test` on Node 18/20/22/24 (Ubuntu) plus Node 24
+  on Windows and macOS, and a job running `npm run typecheck` and checking that
+  `src/index.d.ts` is in the packed tarball. `.github/workflows/benchmark.yml`: manual
+  benchmark run with the output in the job summary and as an artifact.
+
+- ~~**Optional/regex params.**~~ Express 4 `:name?` and `:name(regex)`. Optional params are
+  expanded into one trie route per variant at registration (variants that meet on one node
+  count once); regex constraints are anchored, per segment, tested on the raw segment and
+  checked only on nodes that hold constrained routes. A rejected constraint backtracks.
+- ~~**`next('route')` to less specific routes.**~~ When every route at the matched node bails,
+  `Router.resolveNext()` searches again skipping the nodes already used (`/users/me` →
+  `/users/:id` → `/users/*`), appending only route handlers. Normal requests don't pay for
+  it; an in-process A/B of `app.handle()` measured +2–6 % (≤ ~100 ns), within run-to-run noise.
+- ~~**Precompressed static files.**~~ `serveStatic({ precompressed: true | ['br', 'gzip'] })`
+  serves `file.br` / `file.gz` per `Accept-Encoding` (q-values, `*`), with the original
+  `Content-Type`, its own ETag and `Vary: Accept-Encoding`. `res.sendFile()` gained a
+  `headers` option.
+- ~~**Lost fixes from before `f489113`.**~~ Running the pre-rewrite test suite (`551c303`)
+  against the current code found features the rewrite had dropped, now restored with
+  tests in `test/restored.test.js`: `res.location()`, `redirect('back')` and redirect
+  text bodies; cookie `priority` / `partitioned` and the `sameSite: 'none'` ⇒ `secure`
+  check; `err.expose`; `trustProxy` peer lists / `'loopback'` / predicates; RegExps in
+  `cors()` origin lists and reflected `Access-Control-Request-Headers`; `req.search`.
+  It also exposed two bugs: `/echo//` 404'd (only one trailing empty segment was
+  stripped) and URL fragments leaked into the path and query. Remaining differences from the
+  old suite are deliberate (`Allow` lists `OPTIONS`; `Vary: Origin` for a fixed origin, as
+  Express's `cors` does; `settings` naming; error wording).
+- ~~**Greptile review of PR #5.**~~ `trustProxy` lists now match IPv4-mapped peer
+  addresses (`::ffff:127.0.0.1` vs `127.0.0.1`), which a dual-stack listener reports for IPv4
+  proxies; route constraints with nested repetition (`(a+)+`) are rejected at registration
+  (ReDoS); optional-param variants are deduplicated by matching shape (20 adjacent optionals:
+  21 variants, not 2^20) and capped at 256; `MiddlewareStack` is typed with `StandaloneRequest`
+  (`req.app` optional); workflow actions are pinned to commit SHAs. CI on Windows also exposed
+  `serveStatic` 403s for 8.3 short-name roots (`realpathSync` vs native realpath) and a slow
+  graceful `close()` when a response was already streaming.
 
 Still open:
 
-4. **`next('route')`** and optional/regex params for Express parity.
-5. **TypeScript declarations** (`index.d.ts`) for editor support.
-6. **Server lifecycle:** expose `keepAliveTimeout`/`headersTimeout`/`requestTimeout`, and a
-   graceful `close()` that calls `server.closeIdleConnections()`.
-7. **Trie backtracking bound:** pathological static/param route tables can hit
-   `maxBacktracks` and 404 on a path that should match; consider precomputing
-   static-vs-param conflicts at insert time instead.
-8. **CI:** run `npm test` on Node 18/20/22 in GitHub Actions; publish benchmark results
-   from a dedicated machine rather than a shared VM.
+1. **Benchmarks on dedicated hardware:** the manual Benchmark workflow runs on shared GitHub
+   runners, fine for relative comparisons within one run; published absolute numbers should
+   still come from a dedicated machine.
