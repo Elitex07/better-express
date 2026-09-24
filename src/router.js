@@ -291,6 +291,45 @@ export class Router {
   }
 
   /**
+   * Next-best route match after every route at the previously matched trie nodes bailed
+   * out with next('route'), e.g. `/users/me` -> `/users/:id`. Only called on that path,
+   * so normal requests never pay for it. Middlewares are not included: they already ran.
+   * @param {string} method
+   * @param {string} pathname
+   * @param {Set<object>} skip Trie nodes already used; the new match's node is added
+   * @returns {{ params: Record<string, string>, pipeline: object[], errorHandlers: object[] } | null}
+   */
+  resolveNext(method, pathname, skip) {
+    if (this._dirty) this._compile();
+    const upperMethod = method ? method.toUpperCase() : 'GET';
+    const find = () => {
+      const trie = this._trees.get(upperMethod);
+      let match = trie ? trie.search(pathname, skip) : null;
+      if (!match && upperMethod === 'HEAD') match = this._trees.get('GET').search(pathname, skip);
+      return match;
+    };
+
+    // The first call starts from the node resolve() matched
+    if (skip.size === 0) {
+      const first = find();
+      if (!first) return null;
+      skip.add(first.node);
+    }
+    const match = find();
+    if (!match) return null;
+    skip.add(match.node);
+
+    const pipeline = [];
+    const errorHandlers = [];
+    for (const route of match.matches) {
+      for (const handler of route.handlers) {
+        (handler.length === 4 ? errorHandlers : pipeline).push({ prefix: '', handler, params: route.params, route: route.routeEntry.id });
+      }
+    }
+    return { params: match.params, pipeline, errorHandlers };
+  }
+
+  /**
    * HTTP methods that have a route matching `pathname` (HEAD is implied by GET).
    * Used to answer 405 Method Not Allowed and automatic OPTIONS responses.
    * @param {string} pathname

@@ -5,22 +5,36 @@ import * as http from 'node:http';
 // Route parameters
 // ---------------------------------------------------------------------------
 
-type ParamOf<Segment extends string> =
-  Segment extends `:${infer Name}` ? Name :
+/** `id(\\d+)` -> `id` */
+type StripPattern<S extends string> = S extends `${infer Name}(${string}` ? Name : S;
+
+type RequiredParamOf<Segment extends string> =
+  Segment extends `:${infer Rest}` ? (Rest extends `${string}?` ? never : StripPattern<Rest>) :
   Segment extends '*' ? '*' :
   Segment extends `*${infer Name}` ? '*' | Name :
   never;
 
-type ParamNames<Path extends string> =
-  Path extends `${infer Head}/${infer Tail}` ? ParamOf<Head> | ParamNames<Tail> : ParamOf<Path>;
+type OptionalParamOf<Segment extends string> =
+  Segment extends `:${infer Rest}` ? (Rest extends `${infer Body}?` ? StripPattern<Body> : never) : never;
+
+type RequiredParams<Path extends string> =
+  Path extends `${infer Head}/${infer Tail}` ? RequiredParamOf<Head> | RequiredParams<Tail> : RequiredParamOf<Path>;
+
+type OptionalParams<Path extends string> =
+  Path extends `${infer Head}/${infer Tail}` ? OptionalParamOf<Head> | OptionalParams<Tail> : OptionalParamOf<Path>;
+
+type Flatten<T> = { [K in keyof T]: T[K] };
 
 /**
- * `req.params` shape inferred from a route path literal:
- * `'/users/:id/*rest'` -> `{ id: string; '*': string; rest: string }`.
- * Non-literal paths fall back to `Record<string, string>`.
+ * `req.params` shape inferred from a route path literal (Express 4 syntax):
+ * `'/users/:id(\\d+)/:tab?/*rest'` -> `{ id: string; tab?: string; '*': string; rest: string }`.
+ * Non-literal paths fall back to `Record<string, string>`. Patterns containing "/" are not
+ * inferred correctly; annotate those routes' params yourself.
  */
 export type RouteParameters<Path extends string> =
-  string extends Path ? ParamsDictionary : { [K in ParamNames<Path>]: string };
+  string extends Path
+    ? ParamsDictionary
+    : Flatten<{ [K in RequiredParams<Path>]: string } & { [K in OptionalParams<Path>]?: string }>;
 
 export interface ParamsDictionary {
   [key: string]: string;
@@ -43,6 +57,8 @@ export interface Request<P = ParamsDictionary, ReqBody = any> extends http.Incom
   baseUrl: string;
   /** Parsed query string; `key[]` and repeated keys become arrays. Assignable. */
   query: ParsedQuery;
+  /** Raw query string without the leading "?" ('' when absent). */
+  readonly search: string;
   searchParams: URLSearchParams;
   /** Parsed `Cookie` header. Assignable. */
   cookies: Record<string, string>;
@@ -81,8 +97,11 @@ export interface CookieOptions {
   path?: string;
   httpOnly?: boolean;
   secure?: boolean;
-  /** `true` means `Strict`. */
+  /** `true` means `Strict`; `'none'` requires `secure: true`. */
   sameSite?: boolean | 'strict' | 'lax' | 'none' | 'Strict' | 'Lax' | 'None';
+  priority?: 'low' | 'medium' | 'high' | 'Low' | 'Medium' | 'High';
+  /** CHIPS partitioned cookie; requires `secure: true`. */
+  partitioned?: boolean;
 }
 
 export interface SendFileOptions {
@@ -93,6 +112,8 @@ export interface SendFileOptions {
   /** Serve single byte ranges (206 / 416). Default `true`. */
   acceptRanges?: boolean;
   cacheControl?: string;
+  /** Extra headers, set once the file is found. A Content-Type here wins over the extension. */
+  headers?: Record<string, string | number | readonly string[]>;
   /** Called instead of sending a 404/500 when the file is missing or the stream fails. */
   onError?: (err: Error & { statusCode?: number }) => void;
 }
@@ -112,7 +133,9 @@ export interface Response<ResBody = any> extends http.ServerResponse<http.Incomi
   sendStatus(statusCode: number): this;
   cookie(name: string, value: string, options?: CookieOptions): this;
   clearCookie(name: string, options?: CookieOptions): this;
-  /** Default status 302. */
+  /** Set `Location` without ending the response; `'back'` uses the Referer or `/`. */
+  location(url: string): this;
+  /** Default status 302, with a short text body; `'back'` redirects to the Referer. */
   redirect(url: string, status?: number): this;
   redirect(status: number, url: string): this;
   /** Resolves once the response is finished (or an error response was sent); never rejects. */
@@ -253,7 +276,11 @@ export class Router {
 
 export interface AppOptions extends RouterOptions {
   /** Trust `X-Forwarded-*` for `req.ip` / `protocol` / `hostname`. Default `false`. */
-  trustProxy?: boolean;
+  /**
+   * Trust X-Forwarded-* from: everyone (`true`), listed peer addresses (`'loopback'`,
+   * `'10.0.0.2'`, arrays or comma lists), or a predicate on the peer address.
+   */
+  trustProxy?: boolean | string | readonly string[] | ((remoteAddress: string) => boolean);
   /** Answer 405 + `Allow` and automatic `OPTIONS`. Default `true`; `false` sends 404. */
   methodNotAllowed?: boolean;
   /** ms an idle keep-alive socket stays open (Node default 5000). */
@@ -312,7 +339,7 @@ export class BareWeb {
 
 export type CorsOrigin =
   | string
-  | readonly string[]
+  | ReadonlyArray<string | RegExp>
   | RegExp
   | boolean
   | ((origin: string) => boolean | string | null | undefined);
@@ -321,7 +348,7 @@ export interface CorsOptions {
   /** Default `'*'`. `true` reflects the request origin. */
   origin?: CorsOrigin;
   methods?: string | readonly string[];
-  /** Allowed request headers. */
+  /** Allowed request headers. Default: reflect the preflight's Access-Control-Request-Headers. */
   headers?: string | readonly string[];
   allowedHeaders?: string | readonly string[];
   exposedHeaders?: string | readonly string[];
@@ -336,6 +363,11 @@ export interface CorsOptions {
 export interface ServeStaticOptions extends Omit<SendFileOptions, 'onError'> {
   /** Directory index file, or `false` to disable. Default `'index.html'`. */
   index?: string | false;
+  /**
+   * Serve `file.br` / `file.gz` siblings when the client accepts that encoding.
+   * `true` = `['br', 'gzip']` (preference order). Adds `Vary: Accept-Encoding`.
+   */
+  precompressed?: boolean | ReadonlyArray<'br' | 'gzip'>;
 }
 
 export interface BodyParserOptions {
@@ -374,6 +406,8 @@ export interface TrieMatch {
 }
 
 export interface TrieSearchResult {
+  /** The matched trie node. */
+  node: unknown;
   handlers: Handler[];
   params: ParamsDictionary;
   handlersWithParams: Array<{ handler: Handler; params: ParamsDictionary; routeEntry: unknown }>;
@@ -386,7 +420,8 @@ export class Trie {
   constructor(options?: RouterOptions);
   static splitPath(path: string): string[];
   insert(path: string, handlers: Handler[], routeEntry?: unknown): void;
-  search(pathname: string): TrieSearchResult | null;
+  /** `skip`: nodes to treat as non-matching (used by the next('route') fallback). */
+  search(pathname: string, skip?: Set<unknown>): TrieSearchResult | null;
 }
 
 /** Default body size limit in bytes (1 MB). */

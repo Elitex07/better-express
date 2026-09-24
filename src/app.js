@@ -1,15 +1,16 @@
 import http from 'node:http';
 import { Router } from './router.js';
 import { runPipeline, defaultErrorHandler, notFound } from './middleware.js';
-import { BareRequest, decorateRequest, parseUrl, isValidHost } from './request.js';
+import { BareRequest, decorateRequest, parseUrl, isValidHost, compileTrustProxy } from './request.js';
 import { BareResponse, decorateResponse } from './response.js';
 
 export class BareWeb {
   /**
    * @param {object} [options]
    * @param {number} [options.maxBacktracks] Deprecated and ignored: route search needs no cap
-   * @param {boolean} [options.trustProxy=false] Trust X-Forwarded-For / -Proto / -Host headers
-   *   for req.ip, req.protocol and req.hostname. Enable only behind a reverse proxy.
+   * @param {boolean|string|string[]|Function} [options.trustProxy=false] Trust X-Forwarded-For /
+   *   -Proto / -Host for req.ip, req.protocol and req.hostname: `true`, peer addresses
+   *   ('loopback', '10.0.0.2', ...) or `(remoteAddress) => boolean`. Enable only behind a proxy.
    * @param {boolean} [options.methodNotAllowed=true] Answer 405 (with an Allow header) when the
    *   path exists under other methods, and answer OPTIONS automatically. `false` sends 404 instead.
    * @param {number} [options.keepAliveTimeout] ms an idle keep-alive socket stays open
@@ -24,6 +25,8 @@ export class BareWeb {
     this.router = new Router(options);
     this.server = null;
     this._closing = false;
+    this._trustProxySource = undefined;
+    this._trustProxyFn = undefined;
     this.middleware = {
       use: (...args) => this.use(...args),
       get entries() {
@@ -34,6 +37,7 @@ export class BareWeb {
     // Bind handlers so they can be passed directly as callbacks
     this.handle = this.handle.bind(this);
     this._noMatch = this._noMatch.bind(this);
+    this._nextRoute = this._nextRoute.bind(this);
   }
 
   /**
@@ -106,12 +110,35 @@ export class BareWeb {
       const { isRouteMatched, params, pipeline, errorHandlers } = this.router.resolve(req.method, parsed.pathname);
       decorateRequest(req, params, parsed);
       req.app = this;
-      return runPipeline(req, res, pipeline, errorHandlers, isRouteMatched, this._noMatch);
+      return runPipeline(req, res, pipeline, errorHandlers, isRouteMatched, this._noMatch, this._nextRoute);
     } catch (err) {
       // e.g. a route collision introduced by a sub-router registration after startup
       if (!req.path) decorateRequest(req, {}, parsed);
       defaultErrorHandler(err, req, res);
     }
+  }
+
+  /**
+   * next('route') fallback: the next less specific route for this request, if any.
+   * The trie nodes already tried are kept on the request.
+   */
+  _nextRoute(req) {
+    if (req._routeSkip === undefined) req._routeSkip = new Set();
+    return this.router.resolveNext(req.method, req.path, req._routeSkip);
+  }
+
+  /**
+   * Whether X-Forwarded-* from this peer may be trusted. The predicate is recompiled only
+   * when `settings.trustProxy` changes.
+   * @param {string} remoteAddress
+   */
+  _trustsProxy(remoteAddress) {
+    const option = this.settings.trustProxy;
+    if (option !== this._trustProxySource || this._trustProxyFn === undefined) {
+      this._trustProxySource = option;
+      this._trustProxyFn = compileTrustProxy(option);
+    }
+    return this._trustProxyFn(remoteAddress);
   }
 
   /**

@@ -2,6 +2,7 @@ import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
 import { DEFAULT_BODY_LIMIT } from './request.js';
+import { MIME_TYPES } from './response.js';
 
 /**
  * Execute a resolved pipeline of middlewares and route handlers in registration order.
@@ -17,9 +18,11 @@ import { DEFAULT_BODY_LIMIT } from './request.js';
  * @param {Array<{ prefix: string, handler: Function }>} errorHandlers
  * @param {boolean} isRouteMatched When false and the pipeline runs out, `onNoMatch` is called
  * @param {(req: object, res: object) => void} [onNoMatch] Defaults to a JSON 404
+ * @param {(req: object) => ({ params: object, pipeline: object[], errorHandlers: object[] } | null)} [onRouteBail]
+ *   Supplies the next-best route when the last route entered bailed with next('route')
  * @returns {Promise<void>|undefined}
  */
-export function runPipeline(req, res, pipeline = [], errorHandlers = [], isRouteMatched = false, onNoMatch = notFound) {
+export function runPipeline(req, res, pipeline = [], errorHandlers = [], isRouteMatched = false, onNoMatch = notFound, onRouteBail) {
   let index = 0;
   let errIndex = 0;
   // Most recent async step. Middleware may call next() without returning it, so the
@@ -50,8 +53,9 @@ export function runPipeline(req, res, pipeline = [], errorHandlers = [], isRoute
   };
 
   // next('route') support: items of one route share a non-zero `route` id. If the last
-  // route entered bailed out with next('route') and nothing else responds, the request
-  // falls through to onNoMatch like an unmatched one.
+  // route entered bailed out with next('route') and the pipeline ran out, onRouteBail may
+  // supply a less specific route (appended to this request's own pipeline arrays);
+  // otherwise the request falls through to onNoMatch like an unmatched one.
   let current = null;
   let routeBailed = false;
 
@@ -68,6 +72,15 @@ export function runPipeline(req, res, pipeline = [], errorHandlers = [], isRoute
     }
 
     if (index >= pipeline.length) {
+      if (routeBailed && onRouteBail !== undefined) {
+        const fallback = onRouteBail(req);
+        if (fallback !== null) {
+          for (const item of fallback.pipeline) pipeline.push(item);
+          for (const item of fallback.errorHandlers) errorHandlers.push(item);
+          req.params = fallback.params;
+          return next();
+        }
+      }
       if (!isRouteMatched || routeBailed) onNoMatch(req, res);
       return;
     }
@@ -197,10 +210,12 @@ export function defaultErrorHandler(err, req, res) {
   const rawStatus = Number(error.statusCode ?? error.status);
   const statusCode = Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus <= 599 ? rawStatus : 500;
   const isProduction = process.env.NODE_ENV === 'production';
+  // http-errors convention: `expose` overrides the default (4xx shown, 5xx hidden in production)
+  const expose = typeof error.expose === 'boolean' ? error.expose : statusCode < 500;
 
   const responsePayload = {
     error: {
-      message: isProduction && statusCode >= 500
+      message: isProduction && !expose
         ? http.STATUS_CODES[statusCode] || 'Internal Server Error'
         : error.message || 'Internal Server Error',
       statusCode
@@ -238,11 +253,12 @@ export function appendVary(res, field) {
 /**
  * Built-in zero-dependency CORS middleware.
  * @param {object} [options]
- * @param {string|string[]|RegExp|boolean|Function} [options.origin='*']
+ * @param {string|Array<string|RegExp>|RegExp|boolean|Function} [options.origin='*']
  *   '*', a fixed origin, an allow-list, a RegExp, `true` (reflect request origin),
  *   or `(origin) => boolean|string`.
  * @param {string|string[]} [options.methods]
- * @param {string|string[]} [options.headers] Allowed request headers
+ * @param {string|string[]} [options.headers] Allowed request headers (default: reflect the
+ *   preflight's Access-Control-Request-Headers)
  * @param {string|string[]} [options.exposedHeaders]
  * @param {boolean} [options.credentials]
  * @param {number} [options.maxAge] Preflight cache in seconds
@@ -252,11 +268,14 @@ export function cors(options = {}) {
   const list = (v) => (Array.isArray(v) ? v.join(',') : v);
   const origin = options.origin ?? '*';
   const methods = list(options.methods) || 'GET,HEAD,PUT,PATCH,POST,DELETE';
-  const headers = list(options.headers || options.allowedHeaders) || 'Content-Type,Authorization';
+  // Unset: reflect Access-Control-Request-Headers on preflight (as Express's cors does)
+  const headers = list(options.headers || options.allowedHeaders) || null;
   const exposed = list(options.exposedHeaders) || null;
   const credentials = Boolean(options.credentials);
   const maxAge = options.maxAge !== undefined ? String(options.maxAge) : null;
-  const allowList = Array.isArray(origin) ? new Set(origin) : null;
+  // Origin lists may mix exact strings and RegExps
+  const allowList = Array.isArray(origin) ? new Set(origin.filter((o) => typeof o === 'string')) : null;
+  const allowPatterns = Array.isArray(origin) ? origin.filter((o) => o instanceof RegExp) : null;
   if (credentials && origin === '*') {
     // Reflecting every origin with credentials would let any site read authenticated responses
     throw new TypeError('cors({ credentials: true }) requires an explicit origin (string, array, RegExp, function, or true to reflect)');
@@ -267,7 +286,14 @@ export function cors(options = {}) {
     if (!requestOrigin) return typeof origin === 'string' ? origin : null;
     if (origin === true) return requestOrigin;
     if (typeof origin === 'string') return origin;
-    if (allowList) return allowList.has(requestOrigin) ? requestOrigin : null;
+    if (allowList) {
+      if (allowList.has(requestOrigin)) return requestOrigin;
+      for (const pattern of allowPatterns) {
+        pattern.lastIndex = 0;
+        if (pattern.test(requestOrigin)) return requestOrigin;
+      }
+      return null;
+    }
     if (origin instanceof RegExp) {
       // g/y flags make test() stateful across requests
       origin.lastIndex = 0;
@@ -293,7 +319,13 @@ export function cors(options = {}) {
     if (req.method === 'OPTIONS' && !options.preflightContinue) {
       if (allowedOrigin) {
         res.setHeader('Access-Control-Allow-Methods', methods);
-        res.setHeader('Access-Control-Allow-Headers', headers);
+        if (headers) {
+          res.setHeader('Access-Control-Allow-Headers', headers);
+        } else {
+          appendVary(res, 'Access-Control-Request-Headers');
+          const requested = req.headers['access-control-request-headers'];
+          if (requested) res.setHeader('Access-Control-Allow-Headers', requested);
+        }
         if (maxAge) res.setHeader('Access-Control-Max-Age', maxAge);
       }
       res.statusCode = 204;
@@ -314,6 +346,9 @@ export function cors(options = {}) {
  * @param {boolean} [options.etag=true] Send ETag and answer If-None-Match
  * @param {boolean} [options.lastModified=true] Send Last-Modified and answer If-Modified-Since
  * @param {boolean} [options.acceptRanges=true] Serve byte ranges (206 / 416)
+ * @param {boolean|Array<'br'|'gzip'>} [options.precompressed=false] Serve `file.br` / `file.gz`
+ *   siblings when the client accepts that encoding (`true` = `['br', 'gzip']`, in that
+ *   preference order). Adds `Vary: Accept-Encoding`.
  */
 export function serveStatic(rootPath, options = {}) {
   const resolvedRoot = path.resolve(rootPath);
@@ -324,6 +359,16 @@ export function serveStatic(rootPath, options = {}) {
     realRoot = resolvedRoot;
   }
   const indexFile = options.index === false ? null : (options.index || 'index.html');
+  // Precompressed variants, in server preference order
+  let encodings = null;
+  if (options.precompressed) {
+    encodings = options.precompressed === true ? ['br', 'gzip'] : [...options.precompressed];
+    for (const encoding of encodings) {
+      if (!PRECOMPRESSED_EXT[encoding]) {
+        throw new TypeError(`serveStatic: unsupported precompressed encoding "${encoding}" (use "br" or "gzip")`);
+      }
+    }
+  }
 
   const isInsideRoot = (realPath) => {
     const rel = path.relative(realRoot, realPath);
@@ -381,8 +426,71 @@ export function serveStatic(rootPath, options = {}) {
     }
     if (!stats.isFile()) return next();
 
+    if (encodings !== null) {
+      // The representation depends on Accept-Encoding whether or not a variant exists
+      appendVary(res, 'Accept-Encoding');
+      const variant = await findPrecompressed(fileToServe, req.headers['accept-encoding'], encodings, isInsideRoot);
+      if (variant !== null) {
+        const type = MIME_TYPES[path.extname(fileToServe).toLowerCase()] || 'application/octet-stream';
+        await res.sendFile(variant.path, {
+          ...options,
+          headers: { 'Content-Encoding': variant.encoding, 'Content-Type': type },
+          onError: () => next()
+        });
+        return;
+      }
+    }
+
     await res.sendFile(fileToServe, { ...options, onError: () => next() });
   };
+}
+
+const PRECOMPRESSED_EXT = { br: '.br', gzip: '.gz' };
+
+/**
+ * Client-acceptable encodings from an Accept-Encoding header, as name -> q.
+ * `*` covers unlisted encodings; q=0 excludes.
+ */
+function parseAcceptEncoding(header) {
+  const accepted = new Map();
+  if (!header) return accepted;
+  for (const part of header.split(',')) {
+    const [rawName, ...params] = part.trim().split(';');
+    const name = rawName.trim().toLowerCase();
+    if (!name) continue;
+    let q = 1;
+    for (const param of params) {
+      const [key, value] = param.trim().split('=');
+      if (key.trim().toLowerCase() === 'q') q = Number(value);
+    }
+    accepted.set(name, Number.isFinite(q) ? q : 0);
+  }
+  return accepted;
+}
+
+/**
+ * Pick the first server-preferred encoding the client accepts that has a precompressed
+ * sibling file (`file.br`, `file.gz`) inside the root.
+ * @returns {Promise<{ path: string, encoding: string } | null>}
+ */
+async function findPrecompressed(filePath, acceptEncoding, encodings, isInsideRoot) {
+  const accepted = parseAcceptEncoding(acceptEncoding);
+  if (accepted.size === 0) return null;
+  const wildcard = accepted.get('*');
+  for (const encoding of encodings) {
+    const q = accepted.has(encoding)
+      ? accepted.get(encoding)
+      : encoding === 'gzip' && accepted.has('x-gzip') ? accepted.get('x-gzip') : wildcard;
+    if (!(q > 0)) continue;
+    try {
+      const candidate = await fs.promises.realpath(filePath + PRECOMPRESSED_EXT[encoding]);
+      if (!isInsideRoot(candidate)) continue;
+      if ((await fs.promises.stat(candidate)).isFile()) return { path: candidate, encoding };
+    } catch {
+      // No such variant
+    }
+  }
+  return null;
 }
 
 const JSON_TYPE_RE = /^application\/(?:[\w.+-]+\+)?json\b/i;

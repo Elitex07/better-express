@@ -163,10 +163,31 @@ _Done in the follow-up change:_
   `src/index.d.ts` is in the packed tarball. `.github/workflows/benchmark.yml`: manual
   benchmark run with the output in the job summary and as an artifact.
 
+- ~~**Optional/regex params.**~~ Express 4 `:name?` and `:name(regex)`. Optional params are
+  expanded into one trie route per variant at registration (variants that meet on one node
+  count once); regex constraints are anchored, per segment, tested on the raw segment and
+  checked only on nodes that hold constrained routes. A rejected constraint backtracks.
+- ~~**`next('route')` to less specific routes.**~~ When every route at the matched node bails,
+  `Router.resolveNext()` searches again skipping the nodes already used (`/users/me` →
+  `/users/:id` → `/users/*`), appending only route handlers. Normal requests don't pay for
+  it; an in-process A/B of `app.handle()` measured +2–6 % (≤ ~100 ns), within run-to-run noise.
+- ~~**Precompressed static files.**~~ `serveStatic({ precompressed: true | ['br', 'gzip'] })`
+  serves `file.br` / `file.gz` per `Accept-Encoding` (q-values, `*`), with the original
+  `Content-Type`, its own ETag and `Vary: Accept-Encoding`. `res.sendFile()` gained a
+  `headers` option.
+- ~~**Lost fixes from before `f489113`.**~~ Running the pre-rewrite test suite (`551c303`)
+  against the current code found features the rewrite had dropped, now restored with
+  tests in `test/restored.test.js`: `res.location()`, `redirect('back')` and redirect
+  text bodies; cookie `priority` / `partitioned` and the `sameSite: 'none'` ⇒ `secure`
+  check; `err.expose`; `trustProxy` peer lists / `'loopback'` / predicates; RegExps in
+  `cors()` origin lists and reflected `Access-Control-Request-Headers`; `req.search`.
+  It also exposed two bugs: `/echo//` 404'd (only one trailing empty segment was
+  stripped) and URL fragments leaked into the path and query. Remaining differences from the
+  old suite are deliberate (`Allow` lists `OPTIONS`; `Vary: Origin` for a fixed origin, as
+  Express's `cors` does; `settings` naming; error wording).
+
 Still open:
 
-4. **Optional/regex params** for Express parity (and `next('route')` fallback to less specific
-   patterns, which needs a multi-node trie search).
-5. **Benchmarks on dedicated hardware:** the manual Benchmark workflow runs on shared GitHub
+1. **Benchmarks on dedicated hardware:** the manual Benchmark workflow runs on shared GitHub
    runners, fine for relative comparisons within one run; published absolute numbers should
    still come from a dedicated machine.

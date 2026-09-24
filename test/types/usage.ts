@@ -56,6 +56,32 @@ app.post('/items/:itemId', async (req, res, next) => {
   await next();
   res.send(req.params.itemId);
 });
+// Express 4 optional / regex params
+app.get('/orders/:id(\\d+)/:tab?', (req, res) => {
+  assertType<Equal<typeof req.params, { id: string; tab?: string }>>();
+  const tab: string = req.params.tab ?? 'summary';
+  res.send(`${req.params.id} ${tab}`);
+});
+app.get('/page/:n(\\d+)?', (req, res) => {
+  assertType<Equal<typeof req.params, { n?: string }>>();
+  res.send(req.params.n ?? '1');
+});
+
+// Restored helpers and options
+app.get('/restored', (req, res) => {
+  const search: string = req.search;
+  res.location('back').cookie('sid', 'x', { sameSite: 'none', secure: true, priority: 'high', partitioned: true });
+  res.send(search);
+});
+createApp({ trustProxy: 'loopback' });
+createApp({ trustProxy: ['10.0.0.1', '10.0.0.2'] });
+createApp({ trustProxy: (addr) => addr.startsWith('10.') });
+app.use(cors({ origin: ['https://a.example', /\.b\.example$/] }));
+app.use(serveStatic('dist', { precompressed: true }), serveStatic('assets', { precompressed: ['gzip'] }));
+// @ts-expect-error only br and gzip are supported
+serveStatic('dist', { precompressed: ['zstd'] });
+app.get('/file', (req, res) => res.sendFile('a.js.br', { headers: { 'Content-Encoding': 'br' } }));
+
 const dynamicPath: string = '/x';
 app.put(dynamicPath, (req, res) => {
   const p: Record<string, string> = req.params;

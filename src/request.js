@@ -13,6 +13,33 @@ export const DEFAULT_BODY_LIMIT = 1024 * 1024; // 1 MB
 // Host header per RFC 3986: non-empty reg-name / IPv4 or bracketed IP literal, optional port.
 const HOST_RE = /^(?:[A-Za-z0-9\-._~!$&'()*+,;=%]+|\[[0-9A-Fa-f:.]+\])(?::(\d{0,5}))?$/;
 
+const LOOPBACK = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+
+/**
+ * Normalise the `trustProxy` option into a predicate over the direct peer's address.
+ * - false/undefined: never trust X-Forwarded-* (default; safe when exposed directly)
+ * - true: always trust
+ * - function(remoteAddress): custom decision
+ * - string (comma-separated) | string[]: trust these peer addresses; 'loopback' covers
+ *   127.0.0.1, ::1 and ::ffff:127.0.0.1
+ * @param {boolean|Function|string|string[]} [trustProxy]
+ * @returns {(remoteAddress: string) => boolean}
+ */
+export function compileTrustProxy(trustProxy) {
+  if (trustProxy === true) return () => true;
+  if (typeof trustProxy === 'function') return (addr) => Boolean(trustProxy(addr));
+  if (typeof trustProxy === 'string' || Array.isArray(trustProxy)) {
+    const list = new Set(
+      (Array.isArray(trustProxy) ? trustProxy : trustProxy.split(','))
+        .map((s) => String(s).trim())
+        .filter(Boolean)
+    );
+    if (list.delete('loopback')) for (const addr of LOOPBACK) list.add(addr);
+    return (addr) => list.has(addr);
+  }
+  return () => false;
+}
+
 /**
  * Fast query string parser supporting arrays and duplicate keys.
  * @param {URLSearchParams} searchParams
@@ -51,6 +78,9 @@ export function parseQuery(searchParams) {
  * @returns {{ pathname: string, search: string } | null} null when the target is malformed
  */
 export function parseUrl(rawUrl) {
+  // Browsers never send fragments, but raw clients can; they are not part of the target
+  const hashIdx = rawUrl.indexOf('#');
+  if (hashIdx !== -1) rawUrl = rawUrl.slice(0, hashIdx);
   const qIdx = rawUrl.indexOf('?');
   const rawPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
 
@@ -114,6 +144,12 @@ export class BareRequest extends http.IncomingMessage {
     this._query = value;
   }
 
+  /** Raw query string without the leading "?" ('' when absent). */
+  get search() {
+    const search = this._search;
+    return search ? search.slice(1) : '';
+  }
+
   get searchParams() {
     if (this._searchParams === undefined) {
       this._searchParams = new URLSearchParams(this._search || '');
@@ -127,7 +163,9 @@ export class BareRequest extends http.IncomingMessage {
 
   /** Whether X-Forwarded-* headers may be trusted (see the `trustProxy` app option). */
   get _trustProxy() {
-    return Boolean(this.app && this.app.settings && this.app.settings.trustProxy);
+    const app = this.app;
+    return app !== undefined && typeof app._trustsProxy === 'function' &&
+      app._trustsProxy(this.socket?.remoteAddress || '');
   }
 
   get ip() {
