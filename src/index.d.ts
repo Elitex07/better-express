@@ -375,10 +375,12 @@ export interface BodyParserOptions {
   limit?: number;
 }
 
-export function cors(options?: CorsOptions): RequestHandler;
-export function serveStatic(rootPath: string, options?: ServeStaticOptions): RequestHandler;
-export function json(options?: BodyParserOptions): RequestHandler;
-export function urlencoded(options?: BodyParserOptions): RequestHandler;
+// Built-ins never read req.app, so they are typed for standalone use too; a standalone
+// handler is accepted anywhere an app handler is.
+export function cors(options?: CorsOptions): StandaloneRequestHandler;
+export function serveStatic(rootPath: string, options?: ServeStaticOptions): StandaloneRequestHandler;
+export function json(options?: BodyParserOptions): StandaloneRequestHandler;
+export function urlencoded(options?: BodyParserOptions): StandaloneRequestHandler;
 
 /**
  * A request run through `MiddlewareStack` outside an app: `req.app` is only set when the

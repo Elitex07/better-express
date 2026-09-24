@@ -160,6 +160,12 @@ stack.use((req, res, next) => {
   void trust;
   next();
 });
+// Built-in middleware works both standalone and in apps/routers
+stack.use(json(), urlencoded({ limit: 1024 }), cors({ origin: true }));
+stack.use('/static', serveStatic('public', { precompressed: true }));
+new Router().use(json(), cors());
+const builtIn: RequestHandler = json();
+void builtIn;
 // @ts-expect-error app handlers (typed with a guaranteed req.app) can't run standalone
 stack.use((req: Request, res: Response, next: NextFunction) => { req.app.settings; next(); });
 
