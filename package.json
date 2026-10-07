@@ -1,7 +1,11 @@
 {
   "name": "bareweb",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "A high-performance, optimized, and lightweight web server framework for Node.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Elitex07/better-express.git"
+  },
   "main": "src/index.js",
   "types": "src/index.d.ts",
   "type": "module",
