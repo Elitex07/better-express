@@ -49,6 +49,16 @@ BareWeb /
 
 ---
 
+## 📦 Installation
+
+To use BareWeb in your own project, install it via npm:
+
+```bash
+npm install bareweb
+```
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. Running the Example Server
