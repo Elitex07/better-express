@@ -1,6 +1,6 @@
 {
   "name": "bareweb",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A high-performance, optimized, and lightweight web server framework for Node.js",
   "main": "src/index.js",
   "types": "src/index.d.ts",
